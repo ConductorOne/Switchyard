@@ -1546,3 +1546,46 @@ fn responses_decode_emits_tool_arguments_once() -> TestResult {
     assert_eq!(seen, arguments);
     Ok(())
 }
+
+#[test]
+fn bedrock_converse_stream_translates_to_openai_chat() -> TestResult {
+    let engine = TranslationEngine::default();
+    let mut state =
+        StreamTranslationState::new(WireFormat::BedrockConverse, WireFormat::OpenAiChat);
+    let events = [
+        json!({"messageStart": {"role": "assistant"}}),
+        json!({"contentBlockDelta": {
+            "contentBlockIndex": 0,
+            "delta": {"text": "Hello"}
+        }}),
+        json!({"messageStop": {"stopReason": "end_turn"}}),
+        json!({"metadata": {
+            "usage": {"inputTokens": 3, "outputTokens": 1, "totalTokens": 4}
+        }}),
+    ];
+    let mut translated = Vec::new();
+    for event in events {
+        translated.extend(engine.translate_event(
+            &mut state,
+            WireFormat::BedrockConverse,
+            WireFormat::OpenAiChat,
+            &event,
+        )?);
+    }
+    translated.extend(engine.finish_stream(&mut state, WireFormat::OpenAiChat)?);
+
+    assert!(translated.iter().any(|event| {
+        event["choices"][0]["delta"]["content"] == Value::String("Hello".to_string())
+    }));
+    assert!(
+        translated
+            .iter()
+            .any(|event| event["choices"][0]["finish_reason"] == "stop")
+    );
+    let usage = translated
+        .iter()
+        .find(|event| event["usage"]["total_tokens"] == 4)
+        .ok_or("missing usage chat event")?;
+    assert_eq!(usage["usage"]["total_tokens"], 4);
+    Ok(())
+}

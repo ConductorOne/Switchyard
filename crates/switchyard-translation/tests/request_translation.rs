@@ -2389,3 +2389,51 @@ fn responses_flat_file_data_survives_into_chat() -> TestResult {
     assert_eq!(file["file"]["filename"], "report.pdf");
     Ok(())
 }
+
+// Bedrock Converse owns model placement in the HTTP path, so the JSON body contains
+// only the provider-neutral conversation contract.
+#[test]
+fn openai_chat_translates_to_bedrock_converse_request() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "model": "route-name",
+        "messages": [
+            {"role": "system", "content": "Be concise."},
+            {"role": "user", "content": "Hello"}
+        ],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Lookup data",
+                "parameters": {"type": "object"}
+            }
+        }],
+        "tool_choice": "auto",
+        "max_tokens": 64,
+        "temperature": 0.2
+    });
+
+    let output = engine
+        .translate_request(
+            WireFormat::OpenAiChat,
+            WireFormat::BedrockConverse,
+            &body,
+            &TranslationPolicy::default(),
+        )?
+        .body;
+
+    assert!(output.get("model").is_none());
+    assert_eq!(output["system"], json!([{"text": "Be concise."}]));
+    assert_eq!(
+        output["messages"][0],
+        json!({"role": "user", "content": [{"text": "Hello"}]})
+    );
+    assert_eq!(
+        output["toolConfig"]["tools"][0]["toolSpec"]["name"],
+        "lookup"
+    );
+    assert_eq!(output["toolConfig"]["toolChoice"], json!({"auto": {}}));
+    assert_eq!(output["inferenceConfig"]["maxTokens"], 64);
+    Ok(())
+}
