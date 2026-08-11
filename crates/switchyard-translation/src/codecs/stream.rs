@@ -11,6 +11,7 @@ use serde_json::{Map, Value, json};
 
 use crate::LlmResponseChunk;
 use crate::codecs::anthropic::AnthropicMessagesStreamCodec;
+use crate::codecs::bedrock::stream::BedrockConverseStreamCodec;
 use crate::codecs::openai_chat::OpenAiChatStreamCodec;
 use crate::codecs::responses::OpenAiResponsesStreamCodec;
 use crate::engine::{FormatRegistry, TranslationEngine};
@@ -163,6 +164,7 @@ impl StreamCodecRegistry {
     pub fn with_builtins() -> Self {
         let mut registry = Self::new();
         registry.register(OpenAiChatStreamCodec);
+        registry.register(BedrockConverseStreamCodec);
         registry.register(AnthropicMessagesStreamCodec);
         registry.register(OpenAiResponsesStreamCodec);
         registry

@@ -9,10 +9,11 @@ use switchyard_translation::{
     PRESERVATION_METADATA_KEY, PreservationPolicy, TranslationEngine, TranslationPolicy, WireFormat,
 };
 
-const FORMATS: [WireFormat; 3] = [
+const FORMATS: [WireFormat; 4] = [
     WireFormat::OpenAiChat,
     WireFormat::AnthropicMessages,
     WireFormat::OpenAiResponses,
+    WireFormat::BedrockConverse,
 ];
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -248,14 +249,24 @@ fn embed_policy() -> TranslationPolicy {
     }
 }
 
-// Returns both possible two-hop orders through the non-source formats.
-fn distinct_hop_orders(source: WireFormat) -> [(WireFormat, WireFormat); 2] {
+// Returns every ordered two-hop path through distinct non-source formats.
+fn distinct_hop_orders(source: WireFormat) -> Vec<(WireFormat, WireFormat)> {
     let others = FORMATS
         .iter()
         .copied()
         .filter(|format| *format != source)
         .collect::<Vec<_>>();
-    [(others[0], others[1]), (others[1], others[0])]
+    others
+        .iter()
+        .copied()
+        .flat_map(|first| {
+            others
+                .iter()
+                .copied()
+                .filter(move |second| *second != first)
+                .map(move |second| (first, second))
+        })
+        .collect()
 }
 
 // Asserts a translated body carries the exact original body in preservation metadata.
@@ -283,6 +294,7 @@ fn format_key(format: WireFormat) -> &'static str {
         WireFormat::OpenAiChat => "openai_chat",
         WireFormat::AnthropicMessages => "anthropic_messages",
         WireFormat::OpenAiResponses => "openai_responses",
+        WireFormat::BedrockConverse => "bedrock_converse",
     }
 }
 
@@ -537,6 +549,44 @@ fn request_fixture(format: WireFormat) -> Value {
             "store": false,
             "truncation": "auto"
         }),
+        WireFormat::BedrockConverse => json!({
+            "system": [{"text": "Follow exact instructions."}],
+            "messages": [
+                {"role": "user", "content": [{"text": "Inspect this payload."}]},
+                {"role": "assistant", "content": [{
+                    "toolUse": {
+                        "toolUseId": "call_lookup",
+                        "name": "lookup",
+                        "input": {"query": "rust"}
+                    }
+                }]},
+                {"role": "user", "content": [{
+                    "toolResult": {
+                        "toolUseId": "call_lookup",
+                        "content": [{"text": "result"}],
+                        "status": "success"
+                    }
+                }]}
+            ],
+            "inferenceConfig": {
+                "maxTokens": 888,
+                "temperature": 0.2,
+                "topP": 0.91,
+                "stopSequences": ["STOP"]
+            },
+            "toolConfig": {
+                "tools": [{
+                    "toolSpec": {
+                        "name": "lookup",
+                        "description": "Lookup data",
+                        "inputSchema": {"json": {"type": "object"}}
+                    }
+                }],
+                "toolChoice": {"auto": {}}
+            },
+            "additionalModelRequestFields": {"top_k": 20},
+            "requestMetadata": {"trace": "bedrock-request"}
+        }),
     }
 }
 
@@ -675,6 +725,30 @@ fn response_fixture(format: WireFormat) -> Value {
             "tools": [{"type": "web_search_preview"}],
             "metadata": {"trace": "responses-response", "kept": {"nested": true}},
             "service_tier": "default"
+        }),
+        WireFormat::BedrockConverse => json!({
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"text": "Here is the answer."},
+                        {"toolUse": {
+                            "toolUseId": "call_lookup",
+                            "name": "lookup",
+                            "input": {"query": "rust"}
+                        }}
+                    ]
+                }
+            },
+            "stopReason": "tool_use",
+            "usage": {
+                "inputTokens": 10,
+                "outputTokens": 5,
+                "totalTokens": 15,
+                "cacheReadInputTokens": 2
+            },
+            "metrics": {"latencyMs": 42},
+            "additionalModelResponseFields": {"trace": "bedrock-response"}
         }),
     }
 }
