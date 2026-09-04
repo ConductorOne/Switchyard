@@ -28,8 +28,8 @@ use tracing::Instrument;
 /// [`switchyard_protocol::LlmResponse`] carries either a live
 /// [`switchyard_protocol::LlmResponseStream`] or the terminal aggregate.
 use switchyard_protocol::{
-    Decision, LlmClientError, Request, Response, RoutedCallFailure, RoutedCallFailureClass,
-    RoutingDisposition, RoutingFallbackReason, Signals,
+    Decision, LlmClientError, ProviderTargetsExhaustedSummary, Request, Response,
+    RoutedCallFailure, RoutedCallFailureClass, RoutingDisposition, RoutingFallbackReason, Signals,
 };
 
 use crate::{DriverError, LibsyError, Result, observability};
@@ -494,9 +494,36 @@ fn routed_call_fallback(failure: &RoutedCallFailure) -> Option<RoutingFallbackRe
         RoutingDisposition::Stop => None,
         RoutingDisposition::NextTarget => Some(match failure.class() {
             RoutedCallFailureClass::ContextWindow => RoutingFallbackReason::ContextWindow,
+            // An exhaustion every one of whose real failures was an overflow is an overflow
+            // for this logical model: retain it against the session identity so the next turn
+            // does not re-select a model certain to overflow again and pay for its whole
+            // provider traversal. Bypassed circuits are not real failures, so they neither
+            // establish nor contradict the overflow.
+            RoutedCallFailureClass::ProviderTargetsExhausted
+                if failure
+                    .exhausted()
+                    .is_some_and(all_real_failures_are_overflows) =>
+            {
+                RoutingFallbackReason::ContextWindow
+            }
             _ => RoutingFallbackReason::Unavailable,
         }),
     }
+}
+
+/// Whether every candidate that reached a real attempt overflowed its context window.
+///
+/// An empty real-failure partition — every candidate bypassed by an open circuit — is not
+/// an overflow: nothing proved this model cannot serve the turn.
+fn all_real_failures_are_overflows(summary: &ProviderTargetsExhaustedSummary) -> bool {
+    let mut real = summary
+        .failures()
+        .iter()
+        .filter(|entry| entry.class != RoutedCallFailureClass::CircuitOpen);
+    real.next().is_some_and(|entry| {
+        entry.class == RoutedCallFailureClass::ContextWindow
+            && real.all(|entry| entry.class == RoutedCallFailureClass::ContextWindow)
+    })
 }
 
 /// Calls `target`, falling back to the next eligible target after a route-level failure,
@@ -794,6 +821,68 @@ mod tests {
             classified_client_error(LlmClientError::RoutedCall {
                 failure: RoutedCallFailure::targets_exhausted(summary),
             }),
+            Some(RoutingFallbackReason::Unavailable)
+        );
+    }
+
+    /// An exhaustion whose every real failure was an overflow is an overflow for the whole
+    /// logical model, so the session retains it and does not re-select the model next turn.
+    /// A bypassed circuit is not a real failure and does not break that conclusion; a real
+    /// failure of any other class does.
+    #[test]
+    fn routed_call_fallback_retains_an_all_overflow_exhaustion() {
+        let exhaustion = |attempted, bypassed, failures| {
+            let summary = ProviderTargetsExhaustedSummary::new(attempted, bypassed, failures, None)
+                .expect("valid partition");
+            classified_client_error(LlmClientError::RoutedCall {
+                failure: RoutedCallFailure::targets_exhausted(summary),
+            })
+        };
+
+        assert_eq!(
+            exhaustion(
+                2,
+                0,
+                vec![RoutedFailureCount::new(
+                    RoutedCallFailureClass::ContextWindow,
+                    2
+                )]
+            ),
+            Some(RoutingFallbackReason::ContextWindow)
+        );
+        assert_eq!(
+            exhaustion(
+                1,
+                1,
+                vec![
+                    RoutedFailureCount::new(RoutedCallFailureClass::CircuitOpen, 1),
+                    RoutedFailureCount::new(RoutedCallFailureClass::ContextWindow, 1),
+                ]
+            ),
+            Some(RoutingFallbackReason::ContextWindow)
+        );
+        assert_eq!(
+            exhaustion(
+                2,
+                0,
+                vec![
+                    RoutedFailureCount::new(RoutedCallFailureClass::ContextWindow, 1),
+                    RoutedFailureCount::new(RoutedCallFailureClass::RateLimit, 1),
+                ]
+            ),
+            Some(RoutingFallbackReason::Unavailable)
+        );
+        // Every candidate bypassed proves nothing about this model's context window, so the
+        // hop stays request-local rather than barring the model for the whole session.
+        assert_eq!(
+            exhaustion(
+                0,
+                2,
+                vec![RoutedFailureCount::new(
+                    RoutedCallFailureClass::CircuitOpen,
+                    2
+                )]
+            ),
             Some(RoutingFallbackReason::Unavailable)
         );
     }

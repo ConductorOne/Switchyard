@@ -25,7 +25,10 @@ use crate::core::algorithm::{Algorithm, Driver, LlmTarget, LlmTargetSet};
 use crate::core::classifier::{Classification, Classifier, Score};
 use crate::core::state::{State, StateValue};
 use crate::{LibsyError, Result};
-use switchyard_protocol::{AggLlmResponse, LlmClientError, LlmResponse, Request, Response};
+use switchyard_protocol::{
+    AggLlmResponse, LlmClientError, LlmResponse, Request, Response, RoutedCallFailureClass,
+    RoutingDisposition,
+};
 
 const PROMPT_TEMPLATE: &str = include_str!("../prompts/capability-classifier/prompt.md");
 const SCHEMA_TEMPLATE: &str = include_str!("../prompts/capability-classifier/schema.json");
@@ -529,6 +532,21 @@ impl Classifier<State> for EscalationClassifier {
                 source: LlmClientError::ContextWindowExceeded { .. },
                 ..
             }) => return Ok((decisive(&self.capable.semantic_name), None)),
+            // A routing host classifies its own failures, so the same condition arrives as
+            // a typed class instead: an advanceable overflow, or a target that cannot serve
+            // this request's shape, is the escalation signal the legacy variant carried.
+            Err(LibsyError::ClientCall {
+                source: LlmClientError::RoutedCall { failure },
+                ..
+            }) if failure.disposition() == RoutingDisposition::NextTarget
+                && matches!(
+                    failure.class(),
+                    RoutedCallFailureClass::ContextWindow
+                        | RoutedCallFailureClass::TargetIncompatible
+                ) =>
+            {
+                return Ok((decisive(&self.capable.semantic_name), None));
+            }
             Err(e) => return Err(e),
         };
         let agg = efficient_response
@@ -948,8 +966,8 @@ mod tests {
 
     use super::*;
     use switchyard_protocol::{
-        ContentBlock, InstructionBlock, LlmClientError, LlmRequest, Metadata, ToolCall, ToolResult,
-        completion_text, text_request, text_response,
+        ContentBlock, InstructionBlock, LlmClientError, LlmRequest, Metadata, RoutedCallFailure,
+        ToolCall, ToolResult, completion_text, text_request, text_response,
     };
 
     use crate::algorithms::util::llm_judge::Judge;
@@ -1943,5 +1961,83 @@ mod tests {
             Some("capable answer".to_string())
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn escalation_classifier_falls_back_to_capable_on_advanceable_routed_failure()
+    -> Result<()> {
+        // A routing host returns its own classification instead of the legacy variant. Both
+        // advanceable request-shape classes must escalate to capable exactly as an overflow
+        // does; otherwise a staged route terminates instead of reaching the strong tier.
+        for class in [
+            RoutedCallFailureClass::ContextWindow,
+            RoutedCallFailureClass::TargetIncompatible,
+        ] {
+            let router = escalation_router()?;
+            let serve = move |decision: Decision, _request: Request| async move {
+                match decision.selected_model_id() {
+                    "efficient" => Err(LlmClientError::RoutedCall {
+                        failure: RoutedCallFailure::new(
+                            class,
+                            RoutingDisposition::NextTarget,
+                            None,
+                            None,
+                        )
+                        .expect("valid direct failure"),
+                    }),
+                    "judge" => panic!("the judge must not be consulted when efficient escalates"),
+                    _ => Ok(reply("capable answer")),
+                }
+            };
+
+            let (trace, response) = test_drive(router, classify_request(), serve).await?;
+
+            assert_eq!(
+                trace.last().map(|d| d.selected_model_id()),
+                Some("capable"),
+                "{} should escalate to capable",
+                class.stable_tag()
+            );
+            assert_eq!(
+                response.llm_response.as_agg().map(completion_text),
+                Some("capable answer".to_string())
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn escalation_classifier_surfaces_terminal_routed_failure() {
+        // The disposition is authoritative: a host that says `Stop` must not be second-guessed
+        // into an escalation, even for a class the `NextTarget` arm accepts.
+        let router = escalation_router().expect("escalation router");
+        let serve = |decision: Decision, _request: Request| async move {
+            match decision.selected_model_id() {
+                "efficient" => Err(LlmClientError::RoutedCall {
+                    failure: RoutedCallFailure::new(
+                        RoutedCallFailureClass::ContextWindow,
+                        RoutingDisposition::Stop,
+                        None,
+                        None,
+                    )
+                    .expect("valid direct failure"),
+                }),
+                other => panic!("{other} must not be called after a terminal failure"),
+            }
+        };
+
+        let Err(error) = test_drive(router, classify_request(), serve).await else {
+            panic!("a Stop disposition is terminal for the route");
+        };
+        assert!(
+            matches!(
+                error,
+                LibsyError::ClientCall {
+                    source: LlmClientError::RoutedCall { .. },
+                    ..
+                }
+            ),
+            "expected the host's routed failure to surface, got {error:?}"
+        );
     }
 }
