@@ -21,8 +21,8 @@ use http::StatusCode;
 use parking_lot::Mutex;
 use switchyard_libsy::{Algorithm, CallModel, LibsyError, Result, RoutingOutcome, drive};
 use switchyard_protocol::{
-    LlmClientError, ModelId, Request, Response, RoutedCallFailure, RoutedCallFailureClass,
-    RoutedLlmClient, RoutingDisposition, RoutingFallbackReason,
+    LlmClientError, ModelId, ProviderTargetsExhaustedSummary, Request, Response, RoutedCallFailure,
+    RoutedCallFailureClass, RoutedLlmClient, RoutingDisposition, RoutingFallbackReason,
 };
 use switchyard_translation::prepare_request_for_target;
 
@@ -342,6 +342,17 @@ fn routed_call_fallback(failure: &RoutedCallFailure) -> Option<RoutingFallbackRe
         RoutingDisposition::Stop => None,
         RoutingDisposition::NextTarget => Some(match failure.class() {
             RoutedCallFailureClass::ContextWindow => RoutingFallbackReason::ContextWindow,
+            // An exhaustion every one of whose real failures was an overflow is an overflow
+            // for the whole logical model, not target unavailability. Reporting it as
+            // `Unavailable` is the conflation this contract exists to remove, and it is
+            // what a caller would have to undo to know the request itself needs reshaping.
+            RoutedCallFailureClass::ProviderTargetsExhausted
+                if failure
+                    .exhausted()
+                    .is_some_and(ProviderTargetsExhaustedSummary::is_context_window_exhaustion) =>
+            {
+                RoutingFallbackReason::ContextWindow
+            }
             _ => RoutingFallbackReason::Unavailable,
         }),
     }
@@ -860,6 +871,69 @@ mod tests {
                     failure: RoutedCallFailure::targets_exhausted(summary),
                 },
             )),
+            Some(RoutingFallbackReason::Unavailable)
+        );
+    }
+
+    /// An exhaustion whose every real failure was an overflow is an overflow for the whole
+    /// logical model, so the hop says so rather than reporting target unavailability. A
+    /// bypassed circuit is not a real failure and does not break that conclusion; a real
+    /// failure of any other class does, and an all-bypassed exhaustion proves nothing.
+    #[test]
+    fn routed_call_fallback_reports_an_all_overflow_exhaustion_as_context_window() {
+        let exhaustion = |attempted, bypassed, failures| {
+            let summary = ProviderTargetsExhaustedSummary::new(attempted, bypassed, failures, None)
+                .expect("valid partition");
+            fallback_reason(&LibsyError::client_call(
+                "target",
+                LlmClientError::RoutedCall {
+                    failure: RoutedCallFailure::targets_exhausted(summary),
+                },
+            ))
+        };
+
+        assert_eq!(
+            exhaustion(
+                2,
+                0,
+                vec![RoutedFailureCount::new(
+                    RoutedCallFailureClass::ContextWindow,
+                    2
+                )]
+            ),
+            Some(RoutingFallbackReason::ContextWindow)
+        );
+        assert_eq!(
+            exhaustion(
+                1,
+                1,
+                vec![
+                    RoutedFailureCount::new(RoutedCallFailureClass::CircuitOpen, 1),
+                    RoutedFailureCount::new(RoutedCallFailureClass::ContextWindow, 1),
+                ]
+            ),
+            Some(RoutingFallbackReason::ContextWindow)
+        );
+        assert_eq!(
+            exhaustion(
+                2,
+                0,
+                vec![
+                    RoutedFailureCount::new(RoutedCallFailureClass::ContextWindow, 1),
+                    RoutedFailureCount::new(RoutedCallFailureClass::RateLimit, 1),
+                ]
+            ),
+            Some(RoutingFallbackReason::Unavailable)
+        );
+        assert_eq!(
+            exhaustion(
+                0,
+                2,
+                vec![RoutedFailureCount::new(
+                    RoutedCallFailureClass::CircuitOpen,
+                    2
+                )]
+            ),
             Some(RoutingFallbackReason::Unavailable)
         );
     }

@@ -39,7 +39,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use switchyard_llm_client::{AuxiliaryOperation, ClientRouter, RunObservation, RunObserver};
 use switchyard_protocol::{
-    LlmClientError, Metadata, ModelId, Request, RoutedCallFailure, RoutedCallFailureClass, Usage,
+    LlmClientError, Metadata, ModelId, ProviderTargetsExhaustedSummary, Request, RoutedCallFailure,
+    RoutedCallFailureClass, Usage,
 };
 use switchyard_runner::{
     CallerAuthKind, DecisionTarget, ModelCapabilities, Route, RunOutput, Runner, RunnerError,
@@ -1281,9 +1282,14 @@ fn client_error(error: &LlmClientError) -> Response {
 // provider body. `Retry-After` is emitted only when the host supplied truthful advice.
 fn routed_call_error(failure: &RoutedCallFailure) -> Response {
     let (status, code) = match failure.class() {
-        RoutedCallFailureClass::CircuitOpen
-        | RoutedCallFailureClass::Overloaded
-        | RoutedCallFailureClass::ProviderTargetsExhausted => {
+        // Exhaustion is the one class carrying an aggregate, so its status comes from the
+        // bounded partition rather than the class alone. A summary is structurally
+        // guaranteed here; the fallback keeps the function total without a panic.
+        RoutedCallFailureClass::ProviderTargetsExhausted => failure.exhausted().map_or(
+            (StatusCode::SERVICE_UNAVAILABLE, "model_targets_unavailable"),
+            exhaustion_status,
+        ),
+        RoutedCallFailureClass::CircuitOpen | RoutedCallFailureClass::Overloaded => {
             (StatusCode::SERVICE_UNAVAILABLE, "model_targets_unavailable")
         }
         RoutedCallFailureClass::AttemptTimeout | RoutedCallFailureClass::ProviderTimeout => {
@@ -1300,6 +1306,42 @@ fn routed_call_error(failure: &RoutedCallFailure) -> Response {
         response.headers_mut().insert(RETRY_AFTER, retry_after);
     }
     response
+}
+
+// Resolves an exhaustion to a status in the precedence the aggregate contract defines,
+// reading only the bounded partition: exact availability evidence or a bypassed circuit
+// first, then host or provider timeouts, then the homogeneous rate-limit and
+// request-shape cases, and a plain routing failure for anything mixed. No provider
+// status is consulted, and a bypassed candidate is never a real failure.
+fn exhaustion_status(summary: &ProviderTargetsExhaustedSummary) -> (StatusCode, &'static str) {
+    let any = |class| summary.failures().iter().any(|entry| entry.class == class);
+    let every_real_failure_is = |classes: &[RoutedCallFailureClass]| {
+        summary
+            .failures()
+            .iter()
+            .filter(|entry| entry.class != RoutedCallFailureClass::CircuitOpen)
+            .all(|entry| classes.contains(&entry.class))
+    };
+
+    if summary.bypassed() > 0
+        || any(RoutedCallFailureClass::Overloaded)
+        || any(RoutedCallFailureClass::Transport)
+    {
+        (StatusCode::SERVICE_UNAVAILABLE, "model_targets_unavailable")
+    } else if any(RoutedCallFailureClass::AttemptTimeout)
+        || any(RoutedCallFailureClass::ProviderTimeout)
+    {
+        (StatusCode::GATEWAY_TIMEOUT, "model_attempts_timed_out")
+    } else if every_real_failure_is(&[RoutedCallFailureClass::RateLimit]) {
+        (StatusCode::TOO_MANY_REQUESTS, "model_rate_limited")
+    } else if every_real_failure_is(&[
+        RoutedCallFailureClass::ContextWindow,
+        RoutedCallFailureClass::TargetIncompatible,
+    ]) {
+        (StatusCode::UNPROCESSABLE_ENTITY, "model_route_incompatible")
+    } else {
+        (StatusCode::BAD_GATEWAY, "routing_failure")
+    }
 }
 
 // Milliseconds round up to whole HTTP seconds so advice is never shorter than the host's.
@@ -1788,10 +1830,11 @@ mod tests {
         }
     }
 
-    // Provider exhaustion is unavailability, and its bounded advice rounds up to whole
-    // HTTP seconds so the client never retries earlier than the host advised.
+    // An exhaustion whose every real failure is a rate limit is quota back-off, not
+    // unavailability, and its bounded advice rounds up to whole HTTP seconds so the client
+    // never retries earlier than the host advised.
     #[test]
-    fn routed_call_exhaustion_maps_to_unavailable_with_rounded_retry_after() {
+    fn routed_call_exhaustion_maps_to_rate_limited_with_rounded_retry_after() {
         let summary = ProviderTargetsExhaustedSummary::new(
             2,
             0,
@@ -1806,7 +1849,7 @@ mod tests {
             failure: RoutedCallFailure::targets_exhausted(summary),
         });
 
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
             response
                 .headers()
@@ -1814,6 +1857,91 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("2")
         );
+    }
+
+    // The terminal status of an exhaustion follows the bounded aggregate in the contract's
+    // precedence order, so a mixed route reports the most consequential thing that happened
+    // rather than collapsing every combination back into one unavailability code.
+    #[test]
+    fn routed_call_exhaustion_status_follows_aggregate_precedence() {
+        for (name, attempted, bypassed, failures, expected) in [
+            (
+                "availability + rate-limit",
+                2,
+                0,
+                vec![
+                    RoutedFailureCount::new(RoutedCallFailureClass::Overloaded, 1),
+                    RoutedFailureCount::new(RoutedCallFailureClass::RateLimit, 1),
+                ],
+                (StatusCode::SERVICE_UNAVAILABLE, "model_targets_unavailable"),
+            ),
+            (
+                "circuit-open + timeout",
+                1,
+                1,
+                vec![
+                    RoutedFailureCount::new(RoutedCallFailureClass::CircuitOpen, 1),
+                    RoutedFailureCount::new(RoutedCallFailureClass::AttemptTimeout, 1),
+                ],
+                (StatusCode::SERVICE_UNAVAILABLE, "model_targets_unavailable"),
+            ),
+            (
+                "timeout + rate-limit",
+                2,
+                0,
+                vec![
+                    RoutedFailureCount::new(RoutedCallFailureClass::ProviderTimeout, 1),
+                    RoutedFailureCount::new(RoutedCallFailureClass::RateLimit, 1),
+                ],
+                (StatusCode::GATEWAY_TIMEOUT, "model_attempts_timed_out"),
+            ),
+            (
+                "rate-limit + context",
+                2,
+                0,
+                vec![
+                    RoutedFailureCount::new(RoutedCallFailureClass::RateLimit, 1),
+                    RoutedFailureCount::new(RoutedCallFailureClass::ContextWindow, 1),
+                ],
+                (StatusCode::BAD_GATEWAY, "routing_failure"),
+            ),
+            (
+                "context + incompatible",
+                2,
+                0,
+                vec![
+                    RoutedFailureCount::new(RoutedCallFailureClass::ContextWindow, 1),
+                    RoutedFailureCount::new(RoutedCallFailureClass::TargetIncompatible, 1),
+                ],
+                (StatusCode::UNPROCESSABLE_ENTITY, "model_route_incompatible"),
+            ),
+        ] {
+            let summary = ProviderTargetsExhaustedSummary::new(attempted, bypassed, failures, None)
+                .expect("valid partition");
+            assert_eq!(
+                exhaustion_status(&summary),
+                expected,
+                "{name} should resolve to {expected:?}"
+            );
+
+            // The resolved status reaches the wire, and no provider text rides with it.
+            let failure = RoutedCallFailure::targets_exhausted(summary);
+            let message = failure.to_string();
+            let response = client_error(&LlmClientError::RoutedCall { failure });
+            assert_eq!(response.status(), expected.0, "{name} status on the wire");
+            assert_eq!(
+                response
+                    .extensions()
+                    .get::<RequestLogError>()
+                    .map(|error| error.0.as_str()),
+                Some(message.as_str()),
+                "{name} keeps the bounded provider-neutral message"
+            );
+            assert!(
+                response.headers().get(RETRY_AFTER).is_none(),
+                "{name} carries no advice, so no Retry-After is emitted"
+            );
+        }
     }
 
     /// A successful judge call lands in the per-session routing snapshot under its

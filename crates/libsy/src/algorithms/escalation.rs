@@ -8,6 +8,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use switchyard_protocol::{
     AggLlmResponse, LlmClientError, LlmResponse, Message, ModelId, Request, Response, Role,
+    RoutedCallFailureClass, RoutingDisposition,
 };
 
 use super::util::classifier_contract::ClassifierContractConfig;
@@ -112,6 +113,21 @@ impl Classifier<State> for EscalationClassifier {
                 source: LlmClientError::ContextWindowExceeded { .. },
                 ..
             }) => return Ok((decisive(&self.capable), None)),
+            // A routing host classifies its own failures, so the same condition arrives as
+            // a typed class instead: an advanceable overflow, or a target that cannot serve
+            // this request's shape, is the escalation signal the legacy variant carried.
+            Err(LibsyError::ClientCall {
+                source: LlmClientError::RoutedCall { failure },
+                ..
+            }) if failure.disposition() == RoutingDisposition::NextTarget
+                && matches!(
+                    failure.class(),
+                    RoutedCallFailureClass::ContextWindow
+                        | RoutedCallFailureClass::TargetIncompatible
+                ) =>
+            {
+                return Ok((decisive(&self.capable), None));
+            }
             Err(e) => return Err(e),
         };
         // The call resolves when its stream handle arrives; transport can still fail while
@@ -173,7 +189,7 @@ mod tests {
     use parking_lot::Mutex;
     use switchyard_protocol::{
         ContentBlock, LlmClientError, LlmResponse, LlmResponseChunk, Metadata, Request, Response,
-        completion_text, text_request, text_response,
+        RoutedCallFailure, completion_text, text_request, text_response,
     };
 
     use super::*;
@@ -387,6 +403,88 @@ mod tests {
             Some("capable answer".to_string())
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_capable_on_an_advanceable_routed_failure() -> Result<()> {
+        // A routing host returns its own classification instead of the legacy variant. Both
+        // advanceable request-shape classes must escalate to capable exactly as an overflow
+        // does; otherwise a staged route terminates instead of reaching the strong tier.
+        for class in [
+            RoutedCallFailureClass::ContextWindow,
+            RoutedCallFailureClass::TargetIncompatible,
+        ] {
+            let serve = move |target: ModelId, _request: Request| async move {
+                match target.as_str() {
+                    "efficient" => Err(LlmClientError::RoutedCall {
+                        failure: RoutedCallFailure::new(
+                            class,
+                            RoutingDisposition::NextTarget,
+                            None,
+                            None,
+                        )
+                        .expect("valid direct failure"),
+                    }),
+                    "judge" => panic!("the judge must not be consulted when efficient escalates"),
+                    _ => Ok(reply("capable answer")),
+                }
+            };
+
+            let (selected_model, response) =
+                test_drive(escalation_router()?, classify_request(), serve).await?;
+
+            assert_eq!(
+                selected_model,
+                "capable",
+                "{} should escalate to capable",
+                class.stable_tag()
+            );
+            assert_eq!(
+                response.llm_response.as_agg().map(completion_text),
+                Some("capable answer".to_string())
+            );
+        }
+        Ok(())
+    }
+
+    /// The disposition is authoritative: a host that says `Stop` must not be second-guessed
+    /// into an escalation, even for a class the `NextTarget` arm accepts.
+    #[tokio::test]
+    async fn surfaces_a_terminal_routed_failure() {
+        let serve = |target: ModelId, _request: Request| async move {
+            match target.as_str() {
+                "efficient" => Err(LlmClientError::RoutedCall {
+                    failure: RoutedCallFailure::new(
+                        RoutedCallFailureClass::ContextWindow,
+                        RoutingDisposition::Stop,
+                        None,
+                        None,
+                    )
+                    .expect("valid direct failure"),
+                }),
+                other => panic!("{other} must not be called after a terminal failure"),
+            }
+        };
+
+        let Err(error) = test_drive(
+            escalation_router().expect("escalation router"),
+            classify_request(),
+            serve,
+        )
+        .await
+        else {
+            panic!("a Stop disposition is terminal for the route");
+        };
+        assert!(
+            matches!(
+                error,
+                LibsyError::ClientCall {
+                    source: LlmClientError::RoutedCall { .. },
+                    ..
+                }
+            ),
+            "expected the host's routed failure to surface, got {error:?}"
+        );
     }
 
     /// A transport failure while buffering efficient must bypass the judge and serve capable.
