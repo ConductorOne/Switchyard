@@ -391,6 +391,7 @@ fn decode_content_block(
             // Bedrock Converse models reasoning as text plus a signature; it carries no
             // opaque detail objects to replay.
             details: Vec::new(),
+            openai_chat_field: Default::default(),
         });
     }
     if let Some(image) = object.get("image").and_then(Value::as_object) {

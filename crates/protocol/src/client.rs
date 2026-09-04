@@ -291,7 +291,8 @@ impl ProviderTargetsExhaustedSummary {
     /// # Errors
     ///
     /// Returns [`RoutedFailureInvariant`] unless every invariant holds:
-    /// `attempted + bypassed` is in `1..=`[`MAX_PROVIDER_TARGETS`]; each class appears
+    /// `attempted + bypassed` is in `1..=`[`MAX_PROVIDER_TARGETS`]; `failures` holds at
+    /// most [`MAX_PROVIDER_TARGETS`] entries; each class appears
     /// once with a nonzero count; no entry is
     /// [`ProviderTargetsExhausted`](RoutedCallFailureClass::ProviderTargetsExhausted),
     /// so exhaustion never recurses; the counts sum to `attempted + bypassed`;
@@ -309,6 +310,12 @@ impl ProviderTargetsExhaustedSummary {
             .ok_or(invariant("candidate total overflows"))?;
         if total == 0 || total > MAX_PROVIDER_TARGETS {
             return Err(invariant("candidate total is outside 1..=16"));
+        }
+        // Reject an over-long entry list before reserving for it: a valid partition has at
+        // most one entry per counted candidate, so a caller-supplied length above the
+        // candidate bound can never become a valid summary and must not size an allocation.
+        if failures.len() > MAX_PROVIDER_TARGETS as usize {
+            return Err(invariant("class entry count exceeds the candidate bound"));
         }
 
         // One pass proves the partition: unique nonzero classes, no nested exhaustion,
@@ -365,6 +372,30 @@ impl ProviderTargetsExhaustedSummary {
     /// Per-class counts, ordered by stable tag.
     pub fn failures(&self) -> &[RoutedFailureCount] {
         &self.failures
+    }
+
+    /// Entries for candidates that reached a real provider attempt.
+    ///
+    /// A candidate bypassed by an open circuit is not a real failure: it produced no
+    /// provider evidence, so the aggregate rules are stated over these entries only.
+    pub fn real_failures(&self) -> impl Iterator<Item = &RoutedFailureCount> {
+        self.failures
+            .iter()
+            .filter(|entry| entry.class != RoutedCallFailureClass::CircuitOpen)
+    }
+
+    /// Whether every candidate that reached a real attempt overflowed its context window.
+    ///
+    /// This is a property of the whole logical model rather than one target: the request
+    /// as shaped could not be served by any candidate, which is a request-shape condition
+    /// and not target unavailability. An exhaustion with no real failure at all — every
+    /// candidate bypassed by an open circuit — is not an overflow, because nothing proved
+    /// the model could not serve the turn.
+    pub fn is_context_window_exhaustion(&self) -> bool {
+        let mut real = self.real_failures();
+        real.next()
+            .is_some_and(|entry| entry.class == RoutedCallFailureClass::ContextWindow)
+            && real.all(|entry| entry.class == RoutedCallFailureClass::ContextWindow)
     }
 
     /// Aggregate retry advice, when every exhausted candidate supplied a truthful hint.
@@ -634,6 +665,21 @@ mod tests {
     fn summary_rejects_every_broken_invariant() {
         // Empty candidate set: exhaustion needs at least one candidate.
         assert!(ProviderTargetsExhaustedSummary::new(0, 0, Vec::new(), None).is_err());
+
+        // More class entries than there can be candidates: rejected before any entry is
+        // read, so a caller-supplied length never sizes an allocation.
+        assert!(
+            ProviderTargetsExhaustedSummary::new(
+                1,
+                0,
+                vec![
+                    RoutedFailureCount::new(RoutedCallFailureClass::RateLimit, 1);
+                    MAX_PROVIDER_TARGETS as usize + 1
+                ],
+                None,
+            )
+            .is_err()
+        );
 
         // Above the 16-candidate bound.
         assert!(
