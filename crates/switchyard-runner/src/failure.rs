@@ -5,7 +5,7 @@
 
 use libsy::LibsyError;
 use strum_macros::IntoStaticStr;
-use switchyard_protocol::{LlmClientError, ModelId};
+use switchyard_protocol::{LlmClientError, ModelId, RoutedCallFailureClass};
 
 use crate::RunnerError;
 
@@ -138,6 +138,12 @@ fn client_error_summary(
         _ => None,
     });
     let (kind, upstream_status) = match error {
+        // A routing host classified this itself. Its class is provider-neutral and
+        // already bounded, so it is projected onto the nearest telemetry kind rather
+        // than widening this enum, and its bounded provider status is carried through.
+        LlmClientError::RoutedCall { failure } => {
+            (routed_call_kind(failure.class()), failure.provider_status())
+        }
         LlmClientError::UpstreamHttp { status, .. } => {
             (RouteErrorKind::UpstreamHttp, Some(status.as_u16()))
         }
@@ -156,6 +162,28 @@ fn client_error_summary(
         _ => (RouteErrorKind::Other, None),
     };
     summary(kind, phase, upstream_status, target)
+}
+
+/// Projects a provider-neutral routed-call class onto the nearest telemetry kind.
+///
+/// The routed-call contract classifies more finely than this enum does. Collapsing here
+/// keeps `RouteErrorKind` stable while still recording something truthful; the full class
+/// remains available on the failure itself.
+fn routed_call_kind(class: RoutedCallFailureClass) -> RouteErrorKind {
+    match class {
+        RoutedCallFailureClass::ContextWindow => RouteErrorKind::ContextWindowExceeded,
+        RoutedCallFailureClass::AttemptTimeout | RoutedCallFailureClass::ProviderTimeout => {
+            RouteErrorKind::Timeout
+        }
+        RoutedCallFailureClass::Transport => RouteErrorKind::Transport,
+        RoutedCallFailureClass::InvalidResponse => RouteErrorKind::InvalidResponse,
+        RoutedCallFailureClass::Configuration => RouteErrorKind::Configuration,
+        RoutedCallFailureClass::TargetIncompatible => RouteErrorKind::InvalidRequest,
+        RoutedCallFailureClass::Upstream | RoutedCallFailureClass::ProviderRejected => {
+            RouteErrorKind::UpstreamHttp
+        }
+        _ => RouteErrorKind::Other,
+    }
 }
 
 fn summary(
