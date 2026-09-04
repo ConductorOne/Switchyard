@@ -195,6 +195,7 @@ fn client_call_error_type(error: &LibsyError) -> Cow<'static, str> {
 
 fn llm_client_error_type(error: &LlmClientError) -> Cow<'static, str> {
     match error {
+        LlmClientError::RoutedCall { failure } => Cow::Borrowed(failure.class().stable_tag()),
         LlmClientError::InvalidRequest { .. } => Cow::Borrowed("invalid_request"),
         LlmClientError::RequestTranslation(_) => Cow::Borrowed("request_translation"),
         LlmClientError::RequestEncoding(_) => Cow::Borrowed("request_encoding"),
