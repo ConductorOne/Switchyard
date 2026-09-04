@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Query, Request as HttpRequest, State};
-use axum::http::header::CONTENT_TYPE;
+use axum::http::header::{CONTENT_TYPE, RETRY_AFTER};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -37,7 +37,9 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use switchyard_llm_client::{ClientRouter, RunObservation, RunObserver, TranslatingLlmClient};
-use switchyard_protocol::{Decision, LlmClientError, Metadata, Request, Usage};
+use switchyard_protocol::{
+    Decision, LlmClientError, Metadata, Request, RoutedCallFailure, RoutedCallFailureClass, Usage,
+};
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::task;
 use tracing::{Instrument, Level};
@@ -842,6 +844,7 @@ fn algorithm_error(error: LibsyError) -> Response {
 
 fn client_error(error: &LlmClientError) -> Response {
     match error {
+        LlmClientError::RoutedCall { failure } => routed_call_error(failure),
         LlmClientError::InvalidRequest { message }
         | LlmClientError::RequestTranslation(message) => error_response(
             StatusCode::BAD_REQUEST,
@@ -890,6 +893,38 @@ fn client_error(error: &LlmClientError) -> Response {
         LlmClientError::RequestEncoding(message) => server_error(message),
         _ => server_error(error.to_string()),
     }
+}
+
+// A host-classified routing failure already states what went wrong in bounded,
+// provider-neutral terms, so the status follows the class and the message carries no
+// provider body. `Retry-After` is emitted only when the host supplied truthful advice.
+fn routed_call_error(failure: &RoutedCallFailure) -> Response {
+    let (status, code) = match failure.class() {
+        RoutedCallFailureClass::CircuitOpen
+        | RoutedCallFailureClass::Overloaded
+        | RoutedCallFailureClass::ProviderTargetsExhausted => {
+            (StatusCode::SERVICE_UNAVAILABLE, "model_targets_unavailable")
+        }
+        RoutedCallFailureClass::AttemptTimeout | RoutedCallFailureClass::ProviderTimeout => {
+            (StatusCode::GATEWAY_TIMEOUT, "model_attempts_timed_out")
+        }
+        RoutedCallFailureClass::RateLimit => (StatusCode::TOO_MANY_REQUESTS, "model_rate_limited"),
+        RoutedCallFailureClass::ContextWindow | RoutedCallFailureClass::TargetIncompatible => {
+            (StatusCode::UNPROCESSABLE_ENTITY, "model_route_incompatible")
+        }
+        _ => (StatusCode::BAD_GATEWAY, "routing_failure"),
+    };
+    let mut response = error_response(status, failure.to_string(), "upstream_error", code);
+    if let Some(retry_after) = retry_after_header(failure.retry_after_ms()) {
+        response.headers_mut().insert(RETRY_AFTER, retry_after);
+    }
+    response
+}
+
+// Milliseconds round up to whole HTTP seconds so advice is never shorter than the host's.
+fn retry_after_header(retry_after_ms: Option<u64>) -> Option<HeaderValue> {
+    let seconds = retry_after_ms?.div_ceil(1_000);
+    HeaderValue::from_str(&seconds.to_string()).ok()
 }
 
 // Provider errors are often JSON documents; expose their message without
@@ -1306,6 +1341,9 @@ fn endpoint_listing(has_routing_log: bool) -> String {
 #[cfg(test)]
 mod tests {
     use switchyard_llm_client::LlmCallObservation;
+    use switchyard_protocol::{
+        ProviderTargetsExhaustedSummary, RoutedFailureCount, RoutingDisposition,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{Notify, oneshot};
 
@@ -1459,6 +1497,86 @@ mod tests {
         assert_eq!(
             request_log_level(StatusCode::INTERNAL_SERVER_ERROR),
             Level::ERROR
+        );
+    }
+
+    // A host-classified routing failure maps to a status from its class alone; no
+    // provider status or body decides the terminal response.
+    #[test]
+    fn routed_call_status_follows_failure_class() {
+        for (class, expected) in [
+            (
+                RoutedCallFailureClass::CircuitOpen,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                RoutedCallFailureClass::Overloaded,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                RoutedCallFailureClass::AttemptTimeout,
+                StatusCode::GATEWAY_TIMEOUT,
+            ),
+            (
+                RoutedCallFailureClass::ProviderTimeout,
+                StatusCode::GATEWAY_TIMEOUT,
+            ),
+            (
+                RoutedCallFailureClass::RateLimit,
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            (
+                RoutedCallFailureClass::ContextWindow,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                RoutedCallFailureClass::TargetIncompatible,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                RoutedCallFailureClass::PolicyDenied,
+                StatusCode::BAD_GATEWAY,
+            ),
+            (RoutedCallFailureClass::Unknown, StatusCode::BAD_GATEWAY),
+        ] {
+            let failure = RoutedCallFailure::new(class, RoutingDisposition::Stop, None, Some(200))
+                .expect("valid direct failure");
+            let response = client_error(&LlmClientError::RoutedCall { failure });
+            assert_eq!(
+                response.status(),
+                expected,
+                "{} should map to {expected}",
+                class.stable_tag()
+            );
+            assert!(response.headers().get(RETRY_AFTER).is_none());
+        }
+    }
+
+    // Provider exhaustion is unavailability, and its bounded advice rounds up to whole
+    // HTTP seconds so the client never retries earlier than the host advised.
+    #[test]
+    fn routed_call_exhaustion_maps_to_unavailable_with_rounded_retry_after() {
+        let summary = ProviderTargetsExhaustedSummary::new(
+            2,
+            0,
+            vec![RoutedFailureCount::new(
+                RoutedCallFailureClass::RateLimit,
+                2,
+            )],
+            Some(1_200),
+        )
+        .expect("valid partition");
+        let response = client_error(&LlmClientError::RoutedCall {
+            failure: RoutedCallFailure::targets_exhausted(summary),
+        });
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("2")
         );
     }
 

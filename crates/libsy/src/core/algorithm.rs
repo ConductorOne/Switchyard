@@ -28,7 +28,8 @@ use tracing::Instrument;
 /// [`switchyard_protocol::LlmResponse`] carries either a live
 /// [`switchyard_protocol::LlmResponseStream`] or the terminal aggregate.
 use switchyard_protocol::{
-    Decision, LlmClientError, Request, Response, RoutingFallbackReason, Signals,
+    Decision, LlmClientError, Request, Response, RoutedCallFailure, RoutedCallFailureClass,
+    RoutingDisposition, RoutingFallbackReason, Signals,
 };
 
 use crate::{DriverError, LibsyError, Result, observability};
@@ -458,11 +459,17 @@ pub(crate) fn exclude_evicted(
 }
 
 /// Returns the failed target and routing fallback policy for a terminal client error.
+///
+/// A [`LlmClientError::RoutedCall`] is authoritative: the host already classified the
+/// failure, so its [`RoutingDisposition`] decides whether another target may serve the
+/// request and no status is re-interpreted here. The remaining variants keep the
+/// legacy status-shaped inference for clients that do not classify their own failures.
 fn classify_fallback(error: &LibsyError) -> Option<(&str, RoutingFallbackReason)> {
     let LibsyError::ClientCall { target, source } = error else {
         return None;
     };
     let reason = match source {
+        LlmClientError::RoutedCall { failure } => routed_call_fallback(failure)?,
         LlmClientError::ContextWindowExceeded { .. } => RoutingFallbackReason::ContextWindow,
         LlmClientError::Transport { .. } | LlmClientError::Timeout { .. } => {
             RoutingFallbackReason::Unavailable
@@ -475,6 +482,21 @@ fn classify_fallback(error: &LibsyError) -> Option<(&str, RoutingFallbackReason)
         _ => return None,
     };
     Some((target, reason))
+}
+
+/// Maps a host-classified failure to fallback policy, or `None` to surface it terminally.
+///
+/// The disposition alone decides whether routing advances. The class only picks which
+/// book-keeping the hop gets: a context overflow is retained for the session's identity,
+/// while every other advanceable class stays request-local.
+fn routed_call_fallback(failure: &RoutedCallFailure) -> Option<RoutingFallbackReason> {
+    match failure.disposition() {
+        RoutingDisposition::Stop => None,
+        RoutingDisposition::NextTarget => Some(match failure.class() {
+            RoutedCallFailureClass::ContextWindow => RoutingFallbackReason::ContextWindow,
+            _ => RoutingFallbackReason::Unavailable,
+        }),
+    }
 }
 
 /// Calls `target`, falling back to the next eligible target after a route-level failure,
@@ -617,7 +639,8 @@ mod tests {
     use crate::core::testing::{Serve, ServeResult, echo, reply, test_drive};
     use futures::StreamExt;
     use switchyard_protocol::{
-        LlmResponse, LlmResponseChunk, completion_text, text_request, text_response,
+        LlmResponse, LlmResponseChunk, ProviderTargetsExhaustedSummary, RoutedFailureCount,
+        completion_text, text_request, text_response,
     };
 
     #[derive(Debug, thiserror::Error)]
@@ -680,6 +703,98 @@ mod tests {
                 source: Box::new(std::io::Error::other("invalid response")),
             }),
             None
+        );
+    }
+
+    /// A host-classified failure follows its explicit disposition, so a status that the
+    /// legacy path would have treated as a fallback stops the route when the host says so.
+    #[test]
+    fn routed_call_fallback_follows_disposition_not_status() {
+        let stop = RoutedCallFailure::new(
+            RoutedCallFailureClass::RateLimit,
+            RoutingDisposition::Stop,
+            None,
+            Some(429),
+        )
+        .expect("valid direct failure");
+        assert_eq!(
+            classified_client_error(LlmClientError::RoutedCall { failure: stop }),
+            None
+        );
+
+        let advance = RoutedCallFailure::new(
+            RoutedCallFailureClass::ProviderRejected,
+            RoutingDisposition::NextTarget,
+            None,
+            Some(400),
+        )
+        .expect("valid direct failure");
+        assert_eq!(
+            classified_client_error(LlmClientError::RoutedCall { failure: advance }),
+            Some(RoutingFallbackReason::Unavailable)
+        );
+    }
+
+    /// Only a context overflow is retained against the session identity; every other
+    /// advanceable class stays request-local.
+    #[test]
+    fn routed_call_fallback_maps_class_to_bookkeeping() {
+        assert_eq!(
+            classified_client_error(LlmClientError::RoutedCall {
+                failure: RoutedCallFailure::new(
+                    RoutedCallFailureClass::ContextWindow,
+                    RoutingDisposition::NextTarget,
+                    None,
+                    None,
+                )
+                .expect("valid direct failure"),
+            }),
+            Some(RoutingFallbackReason::ContextWindow)
+        );
+
+        for class in [
+            RoutedCallFailureClass::CircuitOpen,
+            RoutedCallFailureClass::TargetIncompatible,
+            RoutedCallFailureClass::Overloaded,
+            RoutedCallFailureClass::Transport,
+            RoutedCallFailureClass::AttemptTimeout,
+        ] {
+            assert_eq!(
+                classified_client_error(LlmClientError::RoutedCall {
+                    failure: RoutedCallFailure::new(
+                        class,
+                        RoutingDisposition::NextTarget,
+                        None,
+                        None,
+                    )
+                    .expect("valid direct failure"),
+                }),
+                Some(RoutingFallbackReason::Unavailable),
+                "{} should fall back request-locally",
+                class.stable_tag()
+            );
+        }
+    }
+
+    /// Provider exhaustion may still move to another logical model, and its bounded
+    /// summary survives the hop without routing inspecting a status.
+    #[test]
+    fn routed_call_fallback_advances_on_provider_exhaustion() {
+        let summary = ProviderTargetsExhaustedSummary::new(
+            1,
+            1,
+            vec![
+                RoutedFailureCount::new(RoutedCallFailureClass::CircuitOpen, 1),
+                RoutedFailureCount::new(RoutedCallFailureClass::RateLimit, 1),
+            ],
+            None,
+        )
+        .expect("valid partition");
+        assert_eq!(
+            classified_client_error(LlmClientError::RoutedCall {
+                failure: RoutedCallFailure::targets_exhausted(summary),
+            }),
+            Some(RoutingFallbackReason::Unavailable)
         );
     }
 

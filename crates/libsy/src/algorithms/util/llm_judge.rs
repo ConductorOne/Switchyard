@@ -273,6 +273,7 @@ fn libsy_error_reason(error: &LibsyError) -> &'static str {
 /// Returns a bounded reason from the error kind and HTTP status only.
 fn client_error_reason(error: &LlmClientError) -> &'static str {
     match error {
+        LlmClientError::RoutedCall { failure } => failure.class().stable_tag(),
         LlmClientError::Timeout { .. } => "timeout",
         LlmClientError::Transport { .. } => "transport",
         LlmClientError::UpstreamHttp { status, .. } if (500..=599).contains(status) => {
