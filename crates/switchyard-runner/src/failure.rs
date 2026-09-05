@@ -5,7 +5,10 @@
 
 use libsy::LibsyError;
 use strum_macros::IntoStaticStr;
-use switchyard_protocol::{LlmClientError, ModelId};
+use switchyard_protocol::{
+    LlmClientError, ModelId, ProviderTargetsExhaustedSummary, RoutedCallFailure,
+    RoutedCallFailureClass,
+};
 
 use crate::RunnerError;
 
@@ -138,6 +141,12 @@ fn client_error_summary(
         _ => None,
     });
     let (kind, upstream_status) = match error {
+        // A routing host classified this itself. Its class is provider-neutral and
+        // already bounded, so it is projected onto the nearest telemetry kind rather
+        // than widening this enum, and its bounded provider status is carried through.
+        LlmClientError::RoutedCall { failure } => {
+            (routed_call_kind(failure), failure.provider_status())
+        }
         LlmClientError::UpstreamHttp { status, .. } => {
             (RouteErrorKind::UpstreamHttp, Some(status.as_u16()))
         }
@@ -158,6 +167,37 @@ fn client_error_summary(
     summary(kind, phase, upstream_status, target)
 }
 
+/// Projects a provider-neutral routed-call class onto the nearest telemetry kind.
+///
+/// The routed-call contract classifies more finely than this enum does. Collapsing here
+/// keeps `RouteErrorKind` stable while still recording something truthful; the full class
+/// remains available on the failure itself.
+fn routed_call_kind(failure: &RoutedCallFailure) -> RouteErrorKind {
+    // An exhaustion whose every real failure was an overflow is a context-window outcome
+    // for the whole logical model; recording it as `Other` would lose the one fact that
+    // tells an operator the request needs reshaping rather than the targets need fixing.
+    if failure
+        .exhausted()
+        .is_some_and(ProviderTargetsExhaustedSummary::is_context_window_exhaustion)
+    {
+        return RouteErrorKind::ContextWindowExceeded;
+    }
+    match failure.class() {
+        RoutedCallFailureClass::ContextWindow => RouteErrorKind::ContextWindowExceeded,
+        RoutedCallFailureClass::AttemptTimeout | RoutedCallFailureClass::ProviderTimeout => {
+            RouteErrorKind::Timeout
+        }
+        RoutedCallFailureClass::Transport => RouteErrorKind::Transport,
+        RoutedCallFailureClass::InvalidResponse => RouteErrorKind::InvalidResponse,
+        RoutedCallFailureClass::Configuration => RouteErrorKind::Configuration,
+        RoutedCallFailureClass::TargetIncompatible => RouteErrorKind::InvalidRequest,
+        RoutedCallFailureClass::Upstream | RoutedCallFailureClass::ProviderRejected => {
+            RouteErrorKind::UpstreamHttp
+        }
+        _ => RouteErrorKind::Other,
+    }
+}
+
 fn summary(
     kind: RouteErrorKind,
     phase: RouteErrorPhase,
@@ -175,6 +215,83 @@ fn summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use switchyard_protocol::{RoutedFailureCount, RoutingDisposition};
+
+    /// A host-classified failure keeps its meaning in telemetry: the class projects onto
+    /// the nearest kind, and an exhaustion whose every real failure was an overflow is
+    /// recorded as a context-window outcome rather than an unclassified one.
+    #[test]
+    fn routed_call_summaries_keep_their_classification() {
+        let direct = |class, status| {
+            routed_call_kind(
+                &RoutedCallFailure::new(class, RoutingDisposition::NextTarget, None, status)
+                    .expect("valid direct failure"),
+            )
+        };
+        assert!(matches!(
+            direct(RoutedCallFailureClass::ContextWindow, None),
+            RouteErrorKind::ContextWindowExceeded
+        ));
+        assert!(matches!(
+            direct(RoutedCallFailureClass::AttemptTimeout, None),
+            RouteErrorKind::Timeout
+        ));
+        assert!(matches!(
+            direct(RoutedCallFailureClass::Upstream, Some(500)),
+            RouteErrorKind::UpstreamHttp
+        ));
+        assert!(matches!(
+            direct(RoutedCallFailureClass::PolicyDenied, None),
+            RouteErrorKind::Other
+        ));
+
+        let exhaustion = |attempted, bypassed, failures| {
+            let summary = ProviderTargetsExhaustedSummary::new(attempted, bypassed, failures, None)
+                .expect("valid partition");
+            routed_call_kind(&RoutedCallFailure::targets_exhausted(summary))
+        };
+        assert!(matches!(
+            exhaustion(
+                2,
+                0,
+                vec![RoutedFailureCount::new(
+                    RoutedCallFailureClass::ContextWindow,
+                    2
+                )]
+            ),
+            RouteErrorKind::ContextWindowExceeded
+        ));
+        assert!(matches!(
+            exhaustion(
+                2,
+                0,
+                vec![
+                    RoutedFailureCount::new(RoutedCallFailureClass::ContextWindow, 1),
+                    RoutedFailureCount::new(RoutedCallFailureClass::RateLimit, 1),
+                ]
+            ),
+            RouteErrorKind::Other
+        ));
+    }
+
+    /// The bounded provider status survives onto the summary, and no provider text does.
+    #[test]
+    fn routed_call_summary_carries_only_bounded_evidence() {
+        let failure = RoutedCallFailure::new(
+            RoutedCallFailureClass::Overloaded,
+            RoutingDisposition::NextTarget,
+            None,
+            Some(529),
+        )
+        .expect("valid direct failure");
+        let summary = client_error_summary(
+            &LlmClientError::RoutedCall { failure },
+            RouteErrorPhase::BeforeResponse,
+            None,
+        );
+        assert_eq!(summary.upstream_status, Some(529));
+        assert!(summary.target.is_none());
+    }
 
     const SECRET: &str = "patient name is Jane Doe";
 

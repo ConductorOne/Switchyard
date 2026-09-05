@@ -724,3 +724,43 @@ fn content_filter_and_refusal_translate_across_formats() -> TestResult {
     assert_eq!(output["stop_details"]["category"], "cyber");
     Ok(())
 }
+
+#[test]
+fn bedrock_converse_response_translates_to_openai_chat() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "output": {
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"text": "Let me check."},
+                    {"toolUse": {
+                        "toolUseId": "tool-1",
+                        "name": "lookup",
+                        "input": {"query": "weather"}
+                    }}
+                ]
+            }
+        },
+        "stopReason": "tool_use",
+        "usage": {"inputTokens": 8, "outputTokens": 4, "totalTokens": 12}
+    });
+
+    let output = engine
+        .translate_response(
+            WireFormat::BedrockConverse,
+            WireFormat::OpenAiChat,
+            &body,
+            &TranslationPolicy::default(),
+        )?
+        .body;
+
+    assert_eq!(output["choices"][0]["message"]["content"], "Let me check.");
+    assert_eq!(
+        output["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+        "lookup"
+    );
+    assert_eq!(output["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(output["usage"]["total_tokens"], 12);
+    Ok(())
+}

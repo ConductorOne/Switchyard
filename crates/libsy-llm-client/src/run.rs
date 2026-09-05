@@ -21,7 +21,8 @@ use http::StatusCode;
 use parking_lot::Mutex;
 use switchyard_libsy::{Algorithm, CallModel, LibsyError, Result, RoutingOutcome, drive};
 use switchyard_protocol::{
-    LlmClientError, ModelId, Request, Response, RoutedLlmClient, RoutingFallbackReason,
+    LlmClientError, ModelId, ProviderTargetsExhaustedSummary, Request, Response, RoutedCallFailure,
+    RoutedCallFailureClass, RoutedLlmClient, RoutingDisposition, RoutingFallbackReason,
 };
 use switchyard_translation::prepare_request_for_target;
 
@@ -305,11 +306,17 @@ async fn call_one(
 }
 
 /// Whether a failed candidate is worth routing around.
+///
+/// A [`LlmClientError::RoutedCall`] is authoritative: the routing host already classified
+/// the failure, so its [`RoutingDisposition`] decides whether another candidate may serve
+/// the request and no status is re-interpreted here. The remaining variants keep the
+/// legacy status-shaped inference for clients that do not classify their own failures.
 fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
     let LibsyError::ClientCall { source, .. } = error else {
         return None;
     };
     match source {
+        LlmClientError::RoutedCall { failure } => routed_call_fallback(failure),
         LlmClientError::ContextWindowExceeded { .. } => Some(RoutingFallbackReason::ContextWindow),
         LlmClientError::Transport { .. } | LlmClientError::Timeout { .. } => {
             Some(RoutingFallbackReason::Unavailable)
@@ -323,6 +330,31 @@ fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
             Some(RoutingFallbackReason::Unavailable)
         }
         _ => None,
+    }
+}
+
+/// Maps a host-classified failure to fallback policy, or `None` to surface it terminally.
+///
+/// The disposition alone decides whether routing advances. The class only names why, for
+/// the reasoning published on the hop.
+fn routed_call_fallback(failure: &RoutedCallFailure) -> Option<RoutingFallbackReason> {
+    match failure.disposition() {
+        RoutingDisposition::Stop => None,
+        RoutingDisposition::NextTarget => Some(match failure.class() {
+            RoutedCallFailureClass::ContextWindow => RoutingFallbackReason::ContextWindow,
+            // An exhaustion every one of whose real failures was an overflow is an overflow
+            // for the whole logical model, not target unavailability. Reporting it as
+            // `Unavailable` is the conflation this contract exists to remove, and it is
+            // what a caller would have to undo to know the request itself needs reshaping.
+            RoutedCallFailureClass::ProviderTargetsExhausted
+                if failure
+                    .exhausted()
+                    .is_some_and(ProviderTargetsExhaustedSummary::is_context_window_exhaustion) =>
+            {
+                RoutingFallbackReason::ContextWindow
+            }
+            _ => RoutingFallbackReason::Unavailable,
+        }),
     }
 }
 
@@ -447,8 +479,9 @@ mod tests {
     use http::StatusCode;
     use switchyard_libsy::{Driver, RoutingOutcome};
     use switchyard_protocol::{
-        ContentBlock, LlmResponse, LlmResponseChunk, LlmResponseStreamEvent, completion_text,
-        text_request, text_response,
+        ContentBlock, LlmResponse, LlmResponseChunk, LlmResponseStreamEvent,
+        ProviderTargetsExhaustedSummary, RoutedFailureCount, completion_text, text_request,
+        text_response,
     };
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -753,6 +786,156 @@ mod tests {
         );
         assert_eq!(instruction_text(&outcome.request), ["weak prompt"]);
         Ok(())
+    }
+
+    /// A host-classified failure follows its explicit disposition, so a status that the
+    /// legacy path would have treated as a fallback stops the route when the host says so.
+    #[test]
+    fn routed_call_fallback_follows_disposition_not_status() {
+        let error = |source| LibsyError::client_call("target", source);
+        let stop = RoutedCallFailure::new(
+            RoutedCallFailureClass::RateLimit,
+            RoutingDisposition::Stop,
+            None,
+            Some(429),
+        )
+        .expect("valid direct failure");
+        assert_eq!(
+            fallback_reason(&error(LlmClientError::RoutedCall { failure: stop })),
+            None
+        );
+
+        let advance = RoutedCallFailure::new(
+            RoutedCallFailureClass::ProviderRejected,
+            RoutingDisposition::NextTarget,
+            None,
+            Some(400),
+        )
+        .expect("valid direct failure");
+        assert_eq!(
+            fallback_reason(&error(LlmClientError::RoutedCall { failure: advance })),
+            Some(RoutingFallbackReason::Unavailable)
+        );
+    }
+
+    /// The class names why the hop happened: a context overflow is a request-shape
+    /// failure, every other advanceable class is target unavailability.
+    #[test]
+    fn routed_call_fallback_maps_class_to_reason() {
+        let error = |source| LibsyError::client_call("target", source);
+        let advanceable = |class| {
+            fallback_reason(&error(LlmClientError::RoutedCall {
+                failure: RoutedCallFailure::new(class, RoutingDisposition::NextTarget, None, None)
+                    .expect("valid direct failure"),
+            }))
+        };
+
+        assert_eq!(
+            advanceable(RoutedCallFailureClass::ContextWindow),
+            Some(RoutingFallbackReason::ContextWindow)
+        );
+        for class in [
+            RoutedCallFailureClass::CircuitOpen,
+            RoutedCallFailureClass::TargetIncompatible,
+            RoutedCallFailureClass::Overloaded,
+            RoutedCallFailureClass::Transport,
+            RoutedCallFailureClass::AttemptTimeout,
+        ] {
+            assert_eq!(
+                advanceable(class),
+                Some(RoutingFallbackReason::Unavailable),
+                "{} should report target unavailability",
+                class.stable_tag()
+            );
+        }
+    }
+
+    /// Provider exhaustion may still move to another candidate, and its bounded summary
+    /// survives the hop without routing inspecting a status.
+    #[test]
+    fn routed_call_fallback_advances_on_provider_exhaustion() {
+        let summary = ProviderTargetsExhaustedSummary::new(
+            1,
+            1,
+            vec![
+                RoutedFailureCount::new(RoutedCallFailureClass::CircuitOpen, 1),
+                RoutedFailureCount::new(RoutedCallFailureClass::RateLimit, 1),
+            ],
+            None,
+        )
+        .expect("valid partition");
+        assert_eq!(
+            fallback_reason(&LibsyError::client_call(
+                "target",
+                LlmClientError::RoutedCall {
+                    failure: RoutedCallFailure::targets_exhausted(summary),
+                },
+            )),
+            Some(RoutingFallbackReason::Unavailable)
+        );
+    }
+
+    /// An exhaustion whose every real failure was an overflow is an overflow for the whole
+    /// logical model, so the hop says so rather than reporting target unavailability. A
+    /// bypassed circuit is not a real failure and does not break that conclusion; a real
+    /// failure of any other class does, and an all-bypassed exhaustion proves nothing.
+    #[test]
+    fn routed_call_fallback_reports_an_all_overflow_exhaustion_as_context_window() {
+        let exhaustion = |attempted, bypassed, failures| {
+            let summary = ProviderTargetsExhaustedSummary::new(attempted, bypassed, failures, None)
+                .expect("valid partition");
+            fallback_reason(&LibsyError::client_call(
+                "target",
+                LlmClientError::RoutedCall {
+                    failure: RoutedCallFailure::targets_exhausted(summary),
+                },
+            ))
+        };
+
+        assert_eq!(
+            exhaustion(
+                2,
+                0,
+                vec![RoutedFailureCount::new(
+                    RoutedCallFailureClass::ContextWindow,
+                    2
+                )]
+            ),
+            Some(RoutingFallbackReason::ContextWindow)
+        );
+        assert_eq!(
+            exhaustion(
+                1,
+                1,
+                vec![
+                    RoutedFailureCount::new(RoutedCallFailureClass::CircuitOpen, 1),
+                    RoutedFailureCount::new(RoutedCallFailureClass::ContextWindow, 1),
+                ]
+            ),
+            Some(RoutingFallbackReason::ContextWindow)
+        );
+        assert_eq!(
+            exhaustion(
+                2,
+                0,
+                vec![
+                    RoutedFailureCount::new(RoutedCallFailureClass::ContextWindow, 1),
+                    RoutedFailureCount::new(RoutedCallFailureClass::RateLimit, 1),
+                ]
+            ),
+            Some(RoutingFallbackReason::Unavailable)
+        );
+        assert_eq!(
+            exhaustion(
+                0,
+                2,
+                vec![RoutedFailureCount::new(
+                    RoutedCallFailureClass::CircuitOpen,
+                    2
+                )]
+            ),
+            Some(RoutingFallbackReason::Unavailable)
+        );
     }
 
     #[test]
