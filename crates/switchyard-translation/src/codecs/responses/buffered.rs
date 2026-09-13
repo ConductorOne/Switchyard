@@ -313,6 +313,8 @@ impl FormatCodec for OpenAiResponsesCodec {
                 .map(ToOwned::to_owned),
             outputs,
             usage: decode_responses_usage(body.get("usage")),
+            metadata: Default::default(),
+            terminal: None,
             extensions: ProviderExtensions {
                 fields: provider_extensions(
                     body,
@@ -1451,6 +1453,22 @@ fn encode_responses_content(
             ContentBlock::Reasoning { .. }
             | ContentBlock::ToolCall(_)
             | ContentBlock::ToolResult(_) => {}
+            ContentBlock::CustomToolCall(_)
+            | ContentBlock::CustomToolResult(_)
+            | ContentBlock::ComputerToolCall(_)
+            | ContentBlock::ComputerToolResult(_)
+            | ContentBlock::HostedToolCall(_)
+            | ContentBlock::HostedToolResult(_)
+            | ContentBlock::OpaqueState(_)
+            | ContentBlock::Compaction(_)
+            | ContentBlock::GeneratedImage(_)
+            | ContentBlock::PauseTurn(_) => {
+                push_lossy(
+                    diagnostics,
+                    policy,
+                    "typed content block is not representable by the Responses adapter",
+                )?;
+            }
         }
     }
     Ok(Value::Array(blocks))

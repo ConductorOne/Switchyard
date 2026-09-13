@@ -303,6 +303,8 @@ impl FormatCodec for AnthropicMessagesCodec {
                 )),
             }],
             usage: decode_anthropic_usage(body.get("usage")),
+            metadata: Default::default(),
+            terminal: None,
             extensions: ProviderExtensions {
                 fields: provider_extensions(
                     body,
@@ -832,6 +834,22 @@ fn encode_anthropic_content_with_policy(
                 )?;
                 blocks.push(json!({"type": "text", "text": json_string(raw)}));
             }
+            ContentBlock::CustomToolCall(_)
+            | ContentBlock::CustomToolResult(_)
+            | ContentBlock::ComputerToolCall(_)
+            | ContentBlock::ComputerToolResult(_)
+            | ContentBlock::HostedToolCall(_)
+            | ContentBlock::HostedToolResult(_)
+            | ContentBlock::OpaqueState(_)
+            | ContentBlock::Compaction(_)
+            | ContentBlock::GeneratedImage(_)
+            | ContentBlock::PauseTurn(_) => {
+                push_lossy(
+                    diagnostics,
+                    policy,
+                    "typed content block is not representable by the Anthropic adapter",
+                )?;
+            }
             other => blocks.extend(encode_one_anthropic_block(other)),
         }
     }
@@ -974,6 +992,16 @@ fn encode_one_anthropic_block(block: &ContentBlock) -> Vec<Value> {
             }),
             MediaSource::Raw(raw) => raw.clone(),
         }],
+        ContentBlock::CustomToolCall(_)
+        | ContentBlock::CustomToolResult(_)
+        | ContentBlock::ComputerToolCall(_)
+        | ContentBlock::ComputerToolResult(_)
+        | ContentBlock::HostedToolCall(_)
+        | ContentBlock::HostedToolResult(_)
+        | ContentBlock::OpaqueState(_)
+        | ContentBlock::Compaction(_)
+        | ContentBlock::GeneratedImage(_)
+        | ContentBlock::PauseTurn(_) => Vec::new(),
         ContentBlock::Unknown { raw, .. } => vec![raw.clone()],
     }
 }
@@ -997,7 +1025,17 @@ fn encode_one_anthropic_tool_result_block(block: &ContentBlock) -> Vec<Value> {
         | ContentBlock::Audio { .. }
         | ContentBlock::Video { .. }
         | ContentBlock::ToolCall(_)
-        | ContentBlock::ToolResult(_) => Vec::new(),
+        | ContentBlock::ToolResult(_)
+        | ContentBlock::CustomToolCall(_)
+        | ContentBlock::CustomToolResult(_)
+        | ContentBlock::ComputerToolCall(_)
+        | ContentBlock::ComputerToolResult(_)
+        | ContentBlock::HostedToolCall(_)
+        | ContentBlock::HostedToolResult(_)
+        | ContentBlock::OpaqueState(_)
+        | ContentBlock::Compaction(_)
+        | ContentBlock::GeneratedImage(_)
+        | ContentBlock::PauseTurn(_) => Vec::new(),
     }
 }
 
