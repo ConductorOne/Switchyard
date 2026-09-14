@@ -125,6 +125,8 @@ pub fn encode_stream_with_extensions(
     request_extensions: &switchyard_protocol::ProviderExtensions,
 ) -> std::result::Result<RawEventStream, LlmClientError> {
     let origins = crate::codex_namespaces::qualified_tool_origins(request_extensions);
+    let custom_tools = crate::codex_custom_tools::custom_tool_names(request_extensions);
+    let mut custom_state = crate::codex_custom_tools::CustomToolCallStreamState::default();
     let target_format: FormatId = target.into();
     // The target is always a built-in wire format, so this lookup cannot fail; a
     // failure returns as an `Err` rather than a panic.
@@ -152,6 +154,19 @@ pub fn encode_stream_with_extensions(
                 stamp_streamed_response_model(value, target, served_model_for_events.as_deref());
                 crate::codex_namespaces::restore_qualified_tool_names(value, &origins);
             }
+            // Argument deltas for a freeform tool cannot be expressed on the wire; the
+            // rewritten completed item carries the input instead.
+            let mut encoded: Vec<Value> = encoded
+                .into_iter()
+                .filter_map(|mut value| {
+                    crate::codex_custom_tools::restore_custom_tool_calls_in_event(
+                        &mut value,
+                        &custom_tools,
+                        &mut custom_state,
+                    )
+                    .then_some(value)
+                })
+                .collect();
             let terminal = encoded.pop();
             for value in encoded {
                 yield value;
@@ -172,7 +187,13 @@ pub fn encode_stream_with_extensions(
                 served_model_for_events.as_deref(),
             );
             crate::codex_namespaces::restore_qualified_tool_names(&mut value, &origins);
-            yield value;
+            if crate::codex_custom_tools::restore_custom_tool_calls_in_event(
+                &mut value,
+                &custom_tools,
+                &mut custom_state,
+            ) {
+                yield value;
+            }
         }
     };
 
@@ -207,7 +228,43 @@ fn stamp_streamed_response_model(
                 message.insert("model".to_string(), Value::String(served_model.to_string()));
             }
         }
+        WireFormat::BedrockConverse => {}
     }
+}
+
+/// Decodes a stream of already de-framed provider JSON events into neutral IR chunks.
+///
+/// HTTP hosts use this when the carrier is not SSE, such as Amazon Bedrock's
+/// AWS EventStream transport. The host remains responsible for validating and
+/// removing carrier framing; Switchyard owns only the provider event semantics.
+pub fn decode_event_stream<S>(
+    events: S,
+    source: WireFormat,
+) -> std::result::Result<LlmResponseStream, LlmClientError>
+where
+    S: Stream<Item = std::result::Result<Value, LlmClientError>> + Send + 'static,
+{
+    let source_format: FormatId = source.into();
+    let codec = StreamCodecRegistry::with_builtins()
+        .codec(source_format.clone())
+        .map_err(|error| LlmClientError::ResponseTranslation(error.to_string()))?;
+    let mut state = StreamTranslationState {
+        source: Some(source_format.clone()),
+        ..StreamTranslationState::default()
+    };
+    let stream = Box::pin(try_stream! {
+        futures::pin_mut!(events);
+        while let Some(event) = events.next().await {
+            let value = event?;
+            let normalized = codec.decode_event(&mut state, &value);
+            yield LlmResponseStreamEvent::preserved(
+                source_format.clone(),
+                value,
+                normalized,
+            );
+        }
+    });
+    Ok(stream)
 }
 
 /// Decodes provider SSE bytes into normalized stream events.
@@ -346,8 +403,8 @@ mod tests {
     };
 
     use super::{
-        decode_aggregated_response, decode_request, decode_stream, encode_aggregated_response,
-        encode_request, encode_stream, stamp_streamed_response_model,
+        decode_aggregated_response, decode_event_stream, decode_request, decode_stream,
+        encode_aggregated_response, encode_request, encode_stream, stamp_streamed_response_model,
     };
     use crate::{LlmResponseStream, LlmStreamError, WireFormat};
 
@@ -870,6 +927,37 @@ mod tests {
         let bytes = stream::once(async move { Ok::<Vec<u8>, LlmClientError>(sse) });
         let chunks = decode_all(bytes, WireFormat::OpenAiChat)?;
         assert_eq!(text_of(&chunks), "crlf");
+        Ok(())
+    }
+
+    #[test]
+    fn decode_event_stream_accepts_deframed_bedrock_events() -> Result<(), BoxError> {
+        let values = stream::iter(vec![
+            Ok::<Value, LlmClientError>(json!({"messageStart": {"role": "assistant"}})),
+            Ok(json!({"contentBlockDelta": {
+                "contentBlockIndex": 0,
+                "delta": {"text": "bedrock"}
+            }})),
+            Ok(json!({"messageStop": {"stopReason": "end_turn"}})),
+        ]);
+        let chunks =
+            block_on(decode_event_stream(values, WireFormat::BedrockConverse)?.collect::<Vec<_>>())
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
+
+        assert_eq!(text_of(&chunks), "bedrock");
+        assert!(
+            chunks
+                .iter()
+                .flat_map(LlmResponseStreamEvent::normalized)
+                .any(|chunk| matches!(
+                    chunk,
+                    LlmResponseChunk::MessageStop {
+                        reason: Some(reason),
+                        ..
+                    } if reason == "end_turn"
+                ))
+        );
         Ok(())
     }
 

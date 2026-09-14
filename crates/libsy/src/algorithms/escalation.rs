@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use switchyard_protocol::{
-    AggLlmResponse, LlmClientError, LlmResponse, Message, ModelId, Request, Response, Role,
+    AggLlmResponse, Category, LlmClientError, LlmResponse, Message, Request, Response, Role,
+    RoutedCallFailureClass, RoutingDisposition,
 };
 
 use super::util::classifier_contract::ClassifierContractConfig;
@@ -44,33 +45,19 @@ fn assistant_message(response: &AggLlmResponse) -> Message {
 /// not pay for a second model call.
 struct EscalationClassifier {
     judge: JudgeClassifier<EscalationJudge, EscalationPolicy>,
-    capable: ModelId,
-    efficient: ModelId,
     /// Consecutive escalate verdicts required to latch.
     confirmations: u32,
 }
 
 /// Builds the escalation classifier used by the shared LLM classifier route shell.
 pub(super) fn build_classifier(
-    judge_target: ModelId,
-    efficient_target: &ModelId,
-    capable_target: &ModelId,
     contract_config: ClassifierContractConfig,
     config: EscalationJudgeConfig,
     max_output_tokens: u64,
 ) -> Result<Arc<dyn Classifier<State>>> {
     let confirmations = config.confirmations;
     let classifier: Arc<dyn Classifier<State>> = Arc::new(EscalationClassifier {
-        judge: escalation::build_judge(
-            judge_target,
-            capable_target.clone(),
-            efficient_target.clone(),
-            &contract_config,
-            config,
-            max_output_tokens,
-        )?,
-        capable: capable_target.clone(),
-        efficient: efficient_target.clone(),
+        judge: escalation::build_judge(&contract_config, config, max_output_tokens)?,
         confirmations,
     });
     Ok(classifier)
@@ -82,17 +69,18 @@ impl Classifier<State> for EscalationClassifier {
         &self,
         state: &mut State,
         request: &mut Request,
-        driver: Option<&Driver>,
+        driver: &Driver,
     ) -> Result<(Classification, Option<Response>)> {
-        let Some(driver) = driver else {
-            return Err(LibsyError::AlgorithmError {
-                message: "escalation classifier requires a driver".into(),
-            });
-        };
+        let capable = driver.first_model_for(&Category::Capable)?.clone();
+        let efficient = driver.first_model_for(&Category::Efficient)?.clone();
 
         // A confirmed session stays capable without a judge call.
         if streak(state) >= self.confirmations {
-            return Ok((decisive(&self.capable), None));
+            driver.set_evidence(serde_json::json!({
+                "source": "escalation",
+                "verdict": "latched",
+            }));
+            return Ok((decisive(&capable), None));
         }
 
         // Call efficient model and buffer the response so the judge can read it.
@@ -100,18 +88,48 @@ impl Classifier<State> for EscalationClassifier {
         // If the efficient model exceeds its context window, fall through to capable. This call
         // deliberately has one candidate so the classifier sees the efficient model's error.
         tracing::info!(
-            target = %self.efficient,
+            target = %efficient,
             "escalation classifier selected efficient tier"
         );
         let efficient_response = match driver
-            .call_model(request.clone(), vec![self.efficient.clone()])
+            .call_model(request.clone(), vec![efficient.clone()])
             .await
         {
             Ok(r) => r,
             Err(LibsyError::ClientCall {
                 source: LlmClientError::ContextWindowExceeded { .. },
                 ..
-            }) => return Ok((decisive(&self.capable), None)),
+            }) => {
+                driver.set_evidence(serde_json::json!({
+                    "source": "fallback",
+                    "reason_code": "context_window",
+                }));
+                return Ok((decisive(&capable), None));
+            }
+            // A routing host classifies its own failures, so the same condition arrives as
+            // a typed class instead: an advanceable overflow, or a target that cannot serve
+            // this request's shape, is the escalation signal the legacy variant carried.
+            Err(LibsyError::ClientCall {
+                source: LlmClientError::RoutedCall { failure },
+                ..
+            }) if failure.disposition() == RoutingDisposition::NextTarget
+                && matches!(
+                    failure.class(),
+                    RoutedCallFailureClass::ContextWindow
+                        | RoutedCallFailureClass::TargetIncompatible
+                ) =>
+            {
+                let reason_code = match failure.class() {
+                    RoutedCallFailureClass::ContextWindow => "context_window",
+                    RoutedCallFailureClass::TargetIncompatible => "target_incompatible",
+                    _ => unreachable!("guarded routed-call failure class"),
+                };
+                driver.set_evidence(serde_json::json!({
+                    "source": "fallback",
+                    "reason_code": reason_code,
+                }));
+                return Ok((decisive(&capable), None));
+            }
             Err(e) => return Err(e),
         };
         // The call resolves when its stream handle arrives; transport can still fail while
@@ -119,10 +137,14 @@ impl Classifier<State> for EscalationClassifier {
         let agg = match efficient_response.llm_response.into_agg().await {
             Ok(agg) => agg,
             Err(LlmClientError::Transport { .. }) => {
-                return Ok((decisive(&self.capable), None));
+                driver.set_evidence(serde_json::json!({
+                    "source": "fallback",
+                    "reason_code": "transport",
+                }));
+                return Ok((decisive(&capable), None));
             }
             Err(source) => {
-                return Err(LibsyError::client_call(self.efficient.clone(), source));
+                return Err(LibsyError::client_call(efficient.clone(), source));
             }
         };
         // Append the efficient reply so the judge reads this turn's completed trajectory.
@@ -140,15 +162,12 @@ impl Classifier<State> for EscalationClassifier {
             metadata: efficient_response.metadata,
         };
 
-        let (classification, _) = self
-            .judge
-            .score(state, &mut judge_request, Some(driver))
-            .await?;
+        let (classification, _) = self.judge.score(state, &mut judge_request, driver).await?;
 
         let held = streak(state);
         let best = classification.argmax(false)?;
         let (escalate, pending) = match &best {
-            Some(score) if score.target == self.capable => (true, held + 1),
+            Some(score) if score.target == capable => (true, held + 1),
             Some(_) => (false, 0),
             None => (false, held),
         };
@@ -158,28 +177,39 @@ impl Classifier<State> for EscalationClassifier {
 
         if escalate && pending >= self.confirmations {
             // Streak confirmed: drop the efficient response, caller will serve capable.
-            return Ok((decisive(&self.capable), None));
+            driver.set_evidence(serde_json::json!({
+                "source": "escalation",
+                "verdict": "escalate",
+            }));
+            return Ok((decisive(&capable), None));
         }
 
-        Ok((decisive(&self.efficient), Some(efficient_response)))
+        if escalate {
+            driver.set_evidence(serde_json::json!({
+                "source": "escalation",
+                "verdict": "pending",
+            }));
+        }
+
+        Ok((decisive(&efficient), Some(efficient_response)))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::Arc;
 
     use parking_lot::Mutex;
     use switchyard_protocol::{
-        ContentBlock, LlmClientError, LlmResponse, LlmResponseChunk, Metadata, Request, Response,
-        completion_text, text_request, text_response,
+        ContentBlock, LlmClientError, LlmResponse, LlmResponseChunk, Metadata, ModelId, Request,
+        Response, RoutedCallFailure, completion_text, text_request, text_response,
     };
 
     use super::*;
     use crate::algorithms::llm_class::{LlmClassifierConfig, LlmTaskClassifier};
     use crate::algorithms::util::DEFAULT_JUDGE_MAX_OUTPUT_TOKENS;
-    use crate::core::testing::{Serve, reply, test_drive};
+    use crate::core::testing::{Serve, reply, test_drive_with_models};
 
     /// A queue of replies, drained in order.
     struct Queue(Mutex<VecDeque<String>>);
@@ -234,6 +264,19 @@ mod tests {
         }
     }
 
+    fn runtime_models() -> HashMap<Category, Vec<ModelId>> {
+        [
+            (Category::Judge, vec![ModelId::from("judge")]),
+            (Category::Efficient, vec![ModelId::from("efficient")]),
+            (Category::Capable, vec![ModelId::from("capable")]),
+            (
+                Category::Any,
+                vec![ModelId::from("capable"), ModelId::from("efficient")],
+            ),
+        ]
+        .into()
+    }
+
     /// Returns a stream that emits partial content before failing during aggregation.
     fn streamed_then_error(error: LlmClientError) -> Response {
         Response {
@@ -253,9 +296,6 @@ mod tests {
     fn escalation_router() -> Result<Arc<LlmTaskClassifier>> {
         Ok(Arc::new(LlmTaskClassifier::new(
             LlmClassifierConfig::Escalation {
-                judge_target: ModelId::from("judge"),
-                efficient_target: ModelId::from("efficient"),
-                capable_target: ModelId::from("capable"),
                 contract: ClassifierContractConfig::default(),
                 config: EscalationJudgeConfig {
                     confirmations: 1,
@@ -271,9 +311,10 @@ mod tests {
         let judge = Queue::new([r#"{"escalate":false,"reason":"progressing"}"#]);
         let model = Queue::new(["efficient answer"]);
 
-        let (selected_model, response) = test_drive(
+        let (selected_model, response) = test_drive_with_models(
             escalation_router()?,
             classify_request(),
+            runtime_models(),
             queued(model, judge),
         )
         .await?;
@@ -309,9 +350,6 @@ mod tests {
             }
         };
         let router = Arc::new(LlmTaskClassifier::new(LlmClassifierConfig::Escalation {
-            judge_target: ModelId::from("judge"),
-            efficient_target: ModelId::from("efficient"),
-            capable_target: ModelId::from("capable"),
             contract: ClassifierContractConfig::default().with_prompt("Custom trajectory rubric."),
             config: EscalationJudgeConfig {
                 confirmations: 1,
@@ -320,7 +358,7 @@ mod tests {
             max_output_tokens: DEFAULT_JUDGE_MAX_OUTPUT_TOKENS,
         })?);
 
-        test_drive(router, classify_request(), serve).await?;
+        test_drive_with_models(router, classify_request(), runtime_models(), serve).await?;
 
         assert_eq!(&*prompts.lock(), &["Custom trajectory rubric."]);
         Ok(())
@@ -331,9 +369,10 @@ mod tests {
         let judge = Queue::new([r#"{"escalate":true,"reason":"stuck in a loop"}"#]);
         let model = Queue::new(["efficient draft", "capable answer"]);
 
-        let (selected_model, response) = test_drive(
+        let (selected_model, response) = test_drive_with_models(
             escalation_router()?,
             classify_request(),
+            runtime_models(),
             queued(model, judge),
         )
         .await?;
@@ -353,13 +392,15 @@ mod tests {
         let router = escalation_router()?;
         let request = classify_session_request();
 
-        test_drive(
+        test_drive_with_models(
             router.clone(),
             request.clone(),
+            runtime_models(),
             queued(Arc::clone(&model), Arc::clone(&judge)),
         )
         .await?;
-        let (selected_model, _) = test_drive(router, request, queued(model, judge)).await?;
+        let (selected_model, _) =
+            test_drive_with_models(router, request, runtime_models(), queued(model, judge)).await?;
 
         assert_eq!(selected_model, "capable");
         Ok(())
@@ -378,8 +419,13 @@ mod tests {
             }
         };
 
-        let (selected_model, response) =
-            test_drive(escalation_router()?, classify_request(), serve).await?;
+        let (selected_model, response) = test_drive_with_models(
+            escalation_router()?,
+            classify_request(),
+            runtime_models(),
+            serve,
+        )
+        .await?;
 
         assert_eq!(selected_model, "capable");
         assert_eq!(
@@ -415,7 +461,8 @@ mod tests {
         let mut request = classify_request();
         request.llm_request.stream = true;
 
-        let result = test_drive(escalation_router()?, request, serve).await;
+        let result =
+            test_drive_with_models(escalation_router()?, request, runtime_models(), serve).await;
 
         assert_eq!(&*calls.lock(), &["efficient", "capable"]);
         let (_, response) = result?;
@@ -440,7 +487,7 @@ mod tests {
         let mut request = classify_request();
         request.llm_request.stream = true;
 
-        match test_drive(escalation_router()?, request, serve).await {
+        match test_drive_with_models(escalation_router()?, request, runtime_models(), serve).await {
             Err(LibsyError::ClientCall {
                 target,
                 source: LlmClientError::InvalidResponse { .. },
@@ -451,5 +498,92 @@ mod tests {
             Err(other) => panic!("expected InvalidResponse client error, got {other:?}"),
             Ok(_) => panic!("expected stream aggregation to fail"),
         }
+    }
+    #[tokio::test]
+    async fn falls_back_to_capable_on_an_advanceable_routed_failure() -> Result<()> {
+        // A routing host returns its own classification instead of the legacy variant. Both
+        // advanceable request-shape classes must escalate to capable exactly as an overflow
+        // does; otherwise a staged route terminates instead of reaching the strong tier.
+        for class in [
+            RoutedCallFailureClass::ContextWindow,
+            RoutedCallFailureClass::TargetIncompatible,
+        ] {
+            let serve = move |target: ModelId, _request: Request| async move {
+                match target.as_str() {
+                    "efficient" => Err(LlmClientError::RoutedCall {
+                        failure: RoutedCallFailure::new(
+                            class,
+                            RoutingDisposition::NextTarget,
+                            None,
+                            None,
+                        )
+                        .expect("valid direct failure"),
+                    }),
+                    "judge" => panic!("the judge must not be consulted when efficient escalates"),
+                    _ => Ok(reply("capable answer")),
+                }
+            };
+
+            let (selected_model, response) = test_drive_with_models(
+                escalation_router()?,
+                classify_request(),
+                runtime_models(),
+                serve,
+            )
+            .await?;
+
+            assert_eq!(
+                selected_model,
+                "capable",
+                "{} should escalate to capable",
+                class.stable_tag()
+            );
+            assert_eq!(
+                response.llm_response.as_agg().map(completion_text),
+                Some("capable answer".to_string())
+            );
+        }
+        Ok(())
+    }
+
+    /// The disposition is authoritative: a host that says `Stop` must not be second-guessed
+    /// into an escalation, even for a class the `NextTarget` arm accepts.
+    #[tokio::test]
+    async fn surfaces_a_terminal_routed_failure() {
+        let serve = |target: ModelId, _request: Request| async move {
+            match target.as_str() {
+                "efficient" => Err(LlmClientError::RoutedCall {
+                    failure: RoutedCallFailure::new(
+                        RoutedCallFailureClass::ContextWindow,
+                        RoutingDisposition::Stop,
+                        None,
+                        None,
+                    )
+                    .expect("valid direct failure"),
+                }),
+                other => panic!("{other} must not be called after a terminal failure"),
+            }
+        };
+
+        let Err(error) = test_drive_with_models(
+            escalation_router().expect("escalation router"),
+            classify_request(),
+            runtime_models(),
+            serve,
+        )
+        .await
+        else {
+            panic!("a Stop disposition is terminal for the route");
+        };
+        assert!(
+            matches!(
+                error,
+                LibsyError::ClientCall {
+                    source: LlmClientError::RoutedCall { .. },
+                    ..
+                }
+            ),
+            "expected the host's routed failure to surface, got {error:?}"
+        );
     }
 }

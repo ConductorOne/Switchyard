@@ -63,6 +63,10 @@ pub(crate) fn is_terminal_event(format: WireFormat, event: &Value) -> bool {
                 .and_then(Value::as_str),
             Some("response.completed" | "response.incomplete" | "response.failed")
         ),
+        // Bedrock Converse reaches Switchyard through `decode_event_stream`, not this SSE
+        // path, because its carrier is AWS EventStream. Its semantic terminal is still
+        // `messageStop`; a trailing `metadata` event may follow it.
+        WireFormat::BedrockConverse => event.get("messageStop").is_some(),
     }
 }
 

@@ -20,7 +20,7 @@ on:
       - "uv.lock"
       - ".github/workflows/getting-started.yml"
   push:
-    branches: [main]
+    branches: [conductorone/main]
     paths:
       - "docs/getting_started.md"
       - "crates/**"

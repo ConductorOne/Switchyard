@@ -19,9 +19,12 @@ use std::time::Instant;
 
 use http::StatusCode;
 use parking_lot::Mutex;
-use switchyard_libsy::{Algorithm, CallModel, LibsyError, Result, RoutingOutcome, drive};
+use switchyard_libsy::{
+    Algorithm, CallModel, LibsyError, Result, RoutingOutcome, RuntimeModels, drive,
+};
 use switchyard_protocol::{
-    LlmClientError, ModelId, Request, Response, RoutedLlmClient, RoutingFallbackReason,
+    LlmClientError, ModelId, ProviderTargetsExhaustedSummary, Request, Response, RoutedCallFailure,
+    RoutedCallFailureClass, RoutedLlmClient, RoutingDisposition, RoutingFallbackReason,
 };
 use switchyard_translation::prepare_request_for_target;
 
@@ -44,6 +47,7 @@ pub async fn run(
     algorithm: Arc<dyn Algorithm>,
     clients: ClientRouter,
     request: Request,
+    models: Arc<RuntimeModels>,
     observer: Option<RunObserver>,
 ) -> Result<(ModelId, Response)> {
     let algorithm_name = algorithm.name().to_string();
@@ -52,7 +56,7 @@ pub async fn run(
     // This says if we have an observer, put Some(..) in routing_observations.
     // No observer means we don't want any routing_observations.
     let routing_observations = observer.as_ref().map(|_| Arc::new(Mutex::new(Vec::new())));
-    let outcome = drive(algorithm, request, {
+    let outcome = drive(algorithm, request, models, {
         let routing_observations = routing_observations.clone();
         move |call| serve(routing_clients.clone(), call, routing_observations.clone())
     })
@@ -110,9 +114,10 @@ pub async fn decide(
     algorithm: Arc<dyn Algorithm>,
     clients: ClientRouter,
     request: Request,
+    models: Arc<RuntimeModels>,
 ) -> Result<RoutingOutcome> {
     let routing_clients = clients.clone();
-    let mut outcome = drive(algorithm, request, move |call| {
+    let mut outcome = drive(algorithm, request, models, move |call| {
         serve(routing_clients.clone(), call, None)
     })
     .await?;
@@ -130,16 +135,14 @@ fn emit_routing_observations(
     let (Some(observer), Some(observations)) = (observer, observations) else {
         return;
     };
-    let mut answer_observation = None;
+    let mut answer_observed = false;
     for observation in observations.lock().drain(..) {
-        if answer_observation.is_none() && answered_model == Some(&observation.selected_model) {
-            answer_observation = Some(observation);
+        if !answer_observed && answered_model == Some(&observation.selected_model) {
+            answer_observed = true;
+            observer(RunObservation::AnswerCall(observation));
         } else {
             observer(RunObservation::LlmCall(observation));
         }
-    }
-    if let Some(observation) = answer_observation {
-        observer(RunObservation::AnswerCall(observation));
     }
 }
 
@@ -305,11 +308,17 @@ async fn call_one(
 }
 
 /// Whether a failed candidate is worth routing around.
+///
+/// A [`LlmClientError::RoutedCall`] is authoritative: the routing host already classified
+/// the failure, so its [`RoutingDisposition`] decides whether another candidate may serve
+/// the request and no status is re-interpreted here. The remaining variants keep the
+/// legacy status-shaped inference for clients that do not classify their own failures.
 fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
     let LibsyError::ClientCall { source, .. } = error else {
         return None;
     };
     match source {
+        LlmClientError::RoutedCall { failure } => routed_call_fallback(failure),
         LlmClientError::ContextWindowExceeded { .. } => Some(RoutingFallbackReason::ContextWindow),
         LlmClientError::Transport { .. } | LlmClientError::Timeout { .. } => {
             Some(RoutingFallbackReason::Unavailable)
@@ -323,6 +332,31 @@ fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
             Some(RoutingFallbackReason::Unavailable)
         }
         _ => None,
+    }
+}
+
+/// Maps a host-classified failure to fallback policy, or `None` to surface it terminally.
+///
+/// The disposition alone decides whether routing advances. The class only names why, for
+/// the reasoning published on the hop.
+fn routed_call_fallback(failure: &RoutedCallFailure) -> Option<RoutingFallbackReason> {
+    match failure.disposition() {
+        RoutingDisposition::Stop => None,
+        RoutingDisposition::NextTarget => Some(match failure.class() {
+            RoutedCallFailureClass::ContextWindow => RoutingFallbackReason::ContextWindow,
+            // An exhaustion every one of whose real failures was an overflow is an overflow
+            // for the whole logical model, not target unavailability. Reporting it as
+            // `Unavailable` is the conflation this contract exists to remove, and it is
+            // what a caller would have to undo to know the request itself needs reshaping.
+            RoutedCallFailureClass::ProviderTargetsExhausted
+                if failure
+                    .exhausted()
+                    .is_some_and(ProviderTargetsExhaustedSummary::is_context_window_exhaustion) =>
+            {
+                RoutingFallbackReason::ContextWindow
+            }
+            _ => RoutingFallbackReason::Unavailable,
+        }),
     }
 }
 
@@ -447,17 +481,17 @@ mod tests {
     use http::StatusCode;
     use switchyard_libsy::{Driver, RoutingOutcome};
     use switchyard_protocol::{
-        ContentBlock, LlmResponse, LlmResponseChunk, LlmResponseStreamEvent, completion_text,
-        text_request, text_response,
+        ContentBlock, LlmResponse, LlmResponseChunk, LlmResponseStreamEvent,
+        ProviderTargetsExhaustedSummary, RoutedFailureCount, completion_text, text_request,
+        text_response,
     };
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::{Backend, HttpBackendConfig, ModelConfig, TranslatingLlmClient};
+    use switchyard_protocol::Category;
 
-    struct CandidateAlgorithm {
-        models: Vec<ModelId>,
-    }
+    struct CandidateAlgorithm {}
 
     struct AnsweredAlgorithm {
         model: ModelId,
@@ -471,13 +505,14 @@ mod tests {
 
         async fn route(
             self: Arc<Self>,
-            _driver: Driver,
+            driver: Driver,
             request: Request,
         ) -> Result<RoutingOutcome> {
-            let selected_model = self.models.first().cloned().ok_or(LibsyError::NoTargets)?;
+            let models = driver.models_for(&Category::Any);
+            let selected_model = models.first().cloned().ok_or(LibsyError::NoTargets)?;
             Ok(RoutingOutcome::route_to(
                 selected_model,
-                self.models.iter().skip(1).cloned().collect(),
+                models.iter().skip(1).cloned().collect(),
                 request,
             ))
         }
@@ -605,17 +640,27 @@ mod tests {
             requests: Mutex::new(Vec::new()),
             first,
         });
-        let algorithm = Arc::new(CandidateAlgorithm {
-            models: vec!["weak".into(), "strong".into()],
-        });
+        let algorithm = Arc::new(CandidateAlgorithm {});
+        let models = to_category_map(&["weak", "strong"]);
         let result = run(
             algorithm,
             ClientRouter::single(client.clone()),
             request(),
+            models,
             None,
         )
         .await;
         (client, result)
+    }
+
+    fn to_category_map(names: &[&str]) -> Arc<RuntimeModels> {
+        Arc::new(RuntimeModels::new(
+            [(
+                Category::Any,
+                names.iter().map(|name| ModelId::from(*name)).collect(),
+            )]
+            .into(),
+        ))
     }
 
     #[tokio::test]
@@ -635,6 +680,7 @@ mod tests {
             }),
             ClientRouter::single(client.clone()),
             request(),
+            Arc::new(RuntimeModels::default()),
             Some(observer),
         )
         .await?;
@@ -650,6 +696,32 @@ mod tests {
         ));
         assert_eq!(observations.len(), 2);
         Ok(())
+    }
+
+    #[test]
+    fn answer_observation_keeps_call_order() {
+        let pending = Some(Arc::new(Mutex::new(
+            ["answer", "judge"]
+                .map(|model| LlmCallObservation {
+                    selected_model: model.into(),
+                    is_success: true,
+                    duration: std::time::Duration::ZERO,
+                    usage: None,
+                })
+                .into(),
+        )));
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&emitted);
+        let observer: RunObserver = Arc::new(move |event| captured.lock().push(event));
+        let answer = ModelId::from("answer");
+
+        emit_routing_observations(&Some(observer), &pending, Some(&answer));
+
+        assert!(matches!(
+            &emitted.lock()[..],
+            [RunObservation::AnswerCall(answer), RunObservation::LlmCall(judge)]
+                if answer.selected_model == "answer" && judge.selected_model == "judge"
+        ));
     }
 
     #[tokio::test]
@@ -673,11 +745,10 @@ mod tests {
         );
 
         run(
-            Arc::new(CandidateAlgorithm {
-                models: vec!["weak".into(), "strong".into()],
-            }),
+            Arc::new(CandidateAlgorithm {}),
             clients,
             request(),
+            to_category_map(&["weak", "strong"]),
             None,
         )
         .await?;
@@ -709,6 +780,7 @@ mod tests {
             }),
             clients,
             request(),
+            Arc::new(RuntimeModels::default()),
         )
         .await?;
 
@@ -739,11 +811,10 @@ mod tests {
         );
 
         let outcome = decide(
-            Arc::new(CandidateAlgorithm {
-                models: vec!["weak".into(), "strong".into()],
-            }),
+            Arc::new(CandidateAlgorithm {}),
             clients,
             request(),
+            to_category_map(&["weak", "strong"]),
         )
         .await?;
 
@@ -753,6 +824,156 @@ mod tests {
         );
         assert_eq!(instruction_text(&outcome.request), ["weak prompt"]);
         Ok(())
+    }
+
+    /// A host-classified failure follows its explicit disposition, so a status that the
+    /// legacy path would have treated as a fallback stops the route when the host says so.
+    #[test]
+    fn routed_call_fallback_follows_disposition_not_status() {
+        let error = |source| LibsyError::client_call("target", source);
+        let stop = RoutedCallFailure::new(
+            RoutedCallFailureClass::RateLimit,
+            RoutingDisposition::Stop,
+            None,
+            Some(429),
+        )
+        .expect("valid direct failure");
+        assert_eq!(
+            fallback_reason(&error(LlmClientError::RoutedCall { failure: stop })),
+            None
+        );
+
+        let advance = RoutedCallFailure::new(
+            RoutedCallFailureClass::ProviderRejected,
+            RoutingDisposition::NextTarget,
+            None,
+            Some(400),
+        )
+        .expect("valid direct failure");
+        assert_eq!(
+            fallback_reason(&error(LlmClientError::RoutedCall { failure: advance })),
+            Some(RoutingFallbackReason::Unavailable)
+        );
+    }
+
+    /// The class names why the hop happened: a context overflow is a request-shape
+    /// failure, every other advanceable class is target unavailability.
+    #[test]
+    fn routed_call_fallback_maps_class_to_reason() {
+        let error = |source| LibsyError::client_call("target", source);
+        let advanceable = |class| {
+            fallback_reason(&error(LlmClientError::RoutedCall {
+                failure: RoutedCallFailure::new(class, RoutingDisposition::NextTarget, None, None)
+                    .expect("valid direct failure"),
+            }))
+        };
+
+        assert_eq!(
+            advanceable(RoutedCallFailureClass::ContextWindow),
+            Some(RoutingFallbackReason::ContextWindow)
+        );
+        for class in [
+            RoutedCallFailureClass::CircuitOpen,
+            RoutedCallFailureClass::TargetIncompatible,
+            RoutedCallFailureClass::Overloaded,
+            RoutedCallFailureClass::Transport,
+            RoutedCallFailureClass::AttemptTimeout,
+        ] {
+            assert_eq!(
+                advanceable(class),
+                Some(RoutingFallbackReason::Unavailable),
+                "{} should report target unavailability",
+                class.stable_tag()
+            );
+        }
+    }
+
+    /// Provider exhaustion may still move to another candidate, and its bounded summary
+    /// survives the hop without routing inspecting a status.
+    #[test]
+    fn routed_call_fallback_advances_on_provider_exhaustion() {
+        let summary = ProviderTargetsExhaustedSummary::new(
+            1,
+            1,
+            vec![
+                RoutedFailureCount::new(RoutedCallFailureClass::CircuitOpen, 1),
+                RoutedFailureCount::new(RoutedCallFailureClass::RateLimit, 1),
+            ],
+            None,
+        )
+        .expect("valid partition");
+        assert_eq!(
+            fallback_reason(&LibsyError::client_call(
+                "target",
+                LlmClientError::RoutedCall {
+                    failure: RoutedCallFailure::targets_exhausted(summary),
+                },
+            )),
+            Some(RoutingFallbackReason::Unavailable)
+        );
+    }
+
+    /// An exhaustion whose every real failure was an overflow is an overflow for the whole
+    /// logical model, so the hop says so rather than reporting target unavailability. A
+    /// bypassed circuit is not a real failure and does not break that conclusion; a real
+    /// failure of any other class does, and an all-bypassed exhaustion proves nothing.
+    #[test]
+    fn routed_call_fallback_reports_an_all_overflow_exhaustion_as_context_window() {
+        let exhaustion = |attempted, bypassed, failures| {
+            let summary = ProviderTargetsExhaustedSummary::new(attempted, bypassed, failures, None)
+                .expect("valid partition");
+            fallback_reason(&LibsyError::client_call(
+                "target",
+                LlmClientError::RoutedCall {
+                    failure: RoutedCallFailure::targets_exhausted(summary),
+                },
+            ))
+        };
+
+        assert_eq!(
+            exhaustion(
+                2,
+                0,
+                vec![RoutedFailureCount::new(
+                    RoutedCallFailureClass::ContextWindow,
+                    2
+                )]
+            ),
+            Some(RoutingFallbackReason::ContextWindow)
+        );
+        assert_eq!(
+            exhaustion(
+                1,
+                1,
+                vec![
+                    RoutedFailureCount::new(RoutedCallFailureClass::CircuitOpen, 1),
+                    RoutedFailureCount::new(RoutedCallFailureClass::ContextWindow, 1),
+                ]
+            ),
+            Some(RoutingFallbackReason::ContextWindow)
+        );
+        assert_eq!(
+            exhaustion(
+                2,
+                0,
+                vec![
+                    RoutedFailureCount::new(RoutedCallFailureClass::ContextWindow, 1),
+                    RoutedFailureCount::new(RoutedCallFailureClass::RateLimit, 1),
+                ]
+            ),
+            Some(RoutingFallbackReason::Unavailable)
+        );
+        assert_eq!(
+            exhaustion(
+                0,
+                2,
+                vec![RoutedFailureCount::new(
+                    RoutedCallFailureClass::CircuitOpen,
+                    2
+                )]
+            ),
+            Some(RoutingFallbackReason::Unavailable)
+        );
     }
 
     #[test]
@@ -870,6 +1091,7 @@ mod tests {
                 forward_auth: false,
                 extra_headers: BTreeMap::new(),
                 extra_body: BTreeMap::new(),
+                reasoning_effort: None,
                 max_retries: 2,
             })
         };
@@ -880,10 +1102,15 @@ mod tests {
             ])
             .map_err(|error| LibsyError::external("building test client", error))?,
         );
-        let algorithm = Arc::new(CandidateAlgorithm {
-            models: vec!["weak".into(), "strong".into()],
-        });
-        run(algorithm, ClientRouter::single(client), request(), None).await?;
+        let algorithm = Arc::new(CandidateAlgorithm {});
+        run(
+            algorithm,
+            ClientRouter::single(client),
+            request(),
+            to_category_map(&["weak", "strong"]),
+            None,
+        )
+        .await?;
 
         assert_eq!(&*calls.lock(), &["weak", "weak", "weak", "strong"]);
         Ok(())
@@ -961,6 +1188,7 @@ mod tests {
                 forward_auth: false,
                 extra_headers: BTreeMap::new(),
                 extra_body: BTreeMap::new(),
+                reasoning_effort: None,
                 max_retries: 0,
             })
         };
@@ -971,9 +1199,7 @@ mod tests {
             ])
             .expect("building test client"),
         );
-        let algorithm = Arc::new(CandidateAlgorithm {
-            models: vec!["weak".into(), "strong".into()],
-        });
+        let algorithm = Arc::new(CandidateAlgorithm {});
         let mut llm_request = text_request(Some("auto".to_string()), "hello".to_string());
         llm_request.stream = true;
         let request = Request {
@@ -981,7 +1207,14 @@ mod tests {
             raw_request: None,
             metadata: None,
         };
-        let result = run(algorithm, ClientRouter::single(client), request, None).await;
+        let result = run(
+            algorithm,
+            ClientRouter::single(client),
+            request,
+            to_category_map(&["weak", "strong"]),
+            None,
+        )
+        .await;
         (server, calls, result)
     }
 
