@@ -313,7 +313,9 @@ fn encode_responses_stream(
             record_source_identity(state, id, model);
             ensure_responses_created(state)
         }
-        LlmResponseChunk::TextDelta { text, .. } => encode_responses_text_delta(state, text),
+        LlmResponseChunk::TextDelta { text, .. } | LlmResponseChunk::RefusalDelta { text, .. } => {
+            encode_responses_text_delta(state, text)
+        }
         LlmResponseChunk::ReasoningDelta { index, text } => {
             encode_responses_reasoning_delta(state, index, text)
         }
@@ -361,6 +363,21 @@ fn encode_responses_stream(
             state.saw_backend_usage = true;
             Vec::new()
         }
+        LlmResponseChunk::ToolCallDone { .. }
+        | LlmResponseChunk::CustomToolCallDelta { .. }
+        | LlmResponseChunk::CustomToolCallDone { .. }
+        | LlmResponseChunk::ComputerToolCallDone { .. }
+        | LlmResponseChunk::HostedToolCallDone { .. }
+        | LlmResponseChunk::ReasoningStarted { .. }
+        | LlmResponseChunk::ReasoningDone { .. }
+        | LlmResponseChunk::RefusalDone { .. }
+        | LlmResponseChunk::TextDone { .. }
+        | LlmResponseChunk::OpaqueState(_)
+        | LlmResponseChunk::ResponseMetadata(_)
+        | LlmResponseChunk::GeneratedImageDone(_)
+        | LlmResponseChunk::CompactionDone(_)
+        | LlmResponseChunk::PauseTurn(_)
+        | LlmResponseChunk::ResponseTerminal(_) => Vec::new(),
         LlmResponseChunk::MessageStop { reason } => {
             state.stop_reason = reason.or_else(|| state.stop_reason.clone());
             Vec::new()

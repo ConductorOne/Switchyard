@@ -163,7 +163,7 @@ fn encode_bedrock_event(state: &mut StreamTranslationState, event: LlmResponseCh
                 vec![json!({"messageStart": {"role": "assistant"}})]
             }
         }
-        LlmResponseChunk::TextDelta { text, .. } => {
+        LlmResponseChunk::TextDelta { text, .. } | LlmResponseChunk::RefusalDelta { text, .. } => {
             state.output_tokens_seen += 1;
             let index = ensure_text_block(state);
             vec![json!({
@@ -199,6 +199,21 @@ fn encode_bedrock_event(state: &mut StreamTranslationState, event: LlmResponseCh
             state.saw_backend_usage = true;
             Vec::new()
         }
+        LlmResponseChunk::ToolCallDone { .. }
+        | LlmResponseChunk::CustomToolCallDelta { .. }
+        | LlmResponseChunk::CustomToolCallDone { .. }
+        | LlmResponseChunk::ComputerToolCallDone { .. }
+        | LlmResponseChunk::HostedToolCallDone { .. }
+        | LlmResponseChunk::ReasoningStarted { .. }
+        | LlmResponseChunk::ReasoningDone { .. }
+        | LlmResponseChunk::RefusalDone { .. }
+        | LlmResponseChunk::TextDone { .. }
+        | LlmResponseChunk::OpaqueState(_)
+        | LlmResponseChunk::ResponseMetadata(_)
+        | LlmResponseChunk::GeneratedImageDone(_)
+        | LlmResponseChunk::CompactionDone(_)
+        | LlmResponseChunk::PauseTurn(_)
+        | LlmResponseChunk::ResponseTerminal(_) => Vec::new(),
         LlmResponseChunk::MessageStop { reason } => {
             state.stop_reason = reason.or_else(|| state.stop_reason.clone());
             Vec::new()

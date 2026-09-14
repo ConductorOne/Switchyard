@@ -197,7 +197,7 @@ fn encode_openai_chat_stream(
                 )]
             }
         }
-        LlmResponseChunk::TextDelta { text, .. } => {
+        LlmResponseChunk::TextDelta { text, .. } | LlmResponseChunk::RefusalDelta { text, .. } => {
             vec![openai_stream_chunk(
                 state,
                 json!({"content": text}),
@@ -254,6 +254,21 @@ fn encode_openai_chat_stream(
                 Vec::new()
             }
         }
+        LlmResponseChunk::ToolCallDone { .. }
+        | LlmResponseChunk::CustomToolCallDelta { .. }
+        | LlmResponseChunk::CustomToolCallDone { .. }
+        | LlmResponseChunk::ComputerToolCallDone { .. }
+        | LlmResponseChunk::HostedToolCallDone { .. }
+        | LlmResponseChunk::ReasoningStarted { .. }
+        | LlmResponseChunk::ReasoningDone { .. }
+        | LlmResponseChunk::RefusalDone { .. }
+        | LlmResponseChunk::TextDone { .. }
+        | LlmResponseChunk::OpaqueState(_)
+        | LlmResponseChunk::ResponseMetadata(_)
+        | LlmResponseChunk::GeneratedImageDone(_)
+        | LlmResponseChunk::CompactionDone(_)
+        | LlmResponseChunk::PauseTurn(_)
+        | LlmResponseChunk::ResponseTerminal(_) => Vec::new(),
         LlmResponseChunk::MessageStop { reason } => {
             if state.finished {
                 return Vec::new();

@@ -188,6 +188,10 @@ pub enum RoutedCallFailureClass {
     ProviderRejected,
     /// Host policy denied the call.
     PolicyDenied,
+    /// No credential source applies to this exact target and trusted identity.
+    CredentialNotApplicable,
+    /// The credential source recognized the request but denied it.
+    CredentialDenied,
     /// The credential for the target could not be obtained or used.
     CredentialUnavailable,
     /// The target's configuration is invalid.
@@ -220,6 +224,8 @@ impl RoutedCallFailureClass {
             Self::InvalidResponse => "invalid_response",
             Self::ProviderRejected => "provider_rejected",
             Self::PolicyDenied => "policy_denied",
+            Self::CredentialNotApplicable => "credential_not_applicable",
+            Self::CredentialDenied => "credential_denied",
             Self::CredentialUnavailable => "credential_unavailable",
             Self::Configuration => "configuration",
             Self::WorkBudget => "work_budget",
@@ -558,7 +564,7 @@ mod tests {
     use super::*;
 
     /// Every class, so the tag table below cannot silently miss one.
-    const ALL_CLASSES: [RoutedCallFailureClass; 18] = [
+    const ALL_CLASSES: [RoutedCallFailureClass; 20] = [
         RoutedCallFailureClass::CircuitOpen,
         RoutedCallFailureClass::ProviderTargetsExhausted,
         RoutedCallFailureClass::TargetIncompatible,
@@ -572,6 +578,8 @@ mod tests {
         RoutedCallFailureClass::InvalidResponse,
         RoutedCallFailureClass::ProviderRejected,
         RoutedCallFailureClass::PolicyDenied,
+        RoutedCallFailureClass::CredentialNotApplicable,
+        RoutedCallFailureClass::CredentialDenied,
         RoutedCallFailureClass::CredentialUnavailable,
         RoutedCallFailureClass::Configuration,
         RoutedCallFailureClass::WorkBudget,
@@ -597,6 +605,8 @@ mod tests {
             "invalid_response",
             "provider_rejected",
             "policy_denied",
+            "credential_not_applicable",
+            "credential_denied",
             "credential_unavailable",
             "configuration",
             "work_budget",
