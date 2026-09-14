@@ -11,7 +11,6 @@ use serde_json::Value;
 use crate::LlmResponseStreamEvent;
 use crate::codecs::FormatCodec;
 use crate::codecs::anthropic::AnthropicMessagesCodec;
-use crate::codecs::bedrock::BedrockConverseCodec;
 use crate::codecs::openai_chat::OpenAiChatCodec;
 use crate::codecs::responses::OpenAiResponsesCodec;
 use crate::codecs::stream::{
@@ -60,7 +59,6 @@ impl FormatRegistry {
     pub fn with_builtins() -> Self {
         let mut registry = Self::new();
         registry.register(OpenAiChatCodec);
-        registry.register(BedrockConverseCodec);
         registry.register(AnthropicMessagesCodec);
         registry.register(OpenAiResponsesCodec);
         registry
@@ -218,10 +216,6 @@ impl TranslationEngine {
         crate::codex_namespaces::restore_qualified_tool_names(
             &mut output.body,
             &crate::codex_namespaces::qualified_tool_origins(request_extensions),
-        );
-        crate::codex_custom_tools::restore_custom_tool_calls(
-            &mut output.body,
-            &crate::codex_custom_tools::custom_tool_names(request_extensions),
         );
         Ok(output)
     }
