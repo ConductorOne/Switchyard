@@ -1298,6 +1298,9 @@ impl ApiError {
                     "message": self.message.clone(),
                 }
             }),
+            WireFormat::BedrockConverse => json!({
+                "message": self.message.clone(),
+            }),
             WireFormat::OpenAiChat | WireFormat::OpenAiResponses => json!({
                 "error": {
                     "message": self.message.clone(),
