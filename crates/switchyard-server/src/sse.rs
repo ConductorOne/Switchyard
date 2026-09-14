@@ -65,7 +65,6 @@ pub(crate) fn frame_stream(
 fn frame_event(target_format: WireFormat, value: Value) -> Result<Event, axum::Error> {
     match target_format {
         WireFormat::OpenAiChat => Event::default().json_data(value),
-        WireFormat::BedrockConverse => Event::default().json_data(value),
         WireFormat::AnthropicMessages | WireFormat::OpenAiResponses => {
             let event_type = value
                 .get("type")
@@ -84,14 +83,6 @@ fn error_event(target_format: WireFormat, message: String) -> Event {
                 "error": {
                     "message": message,
                     "type": "SwitchyardError",
-                }
-            })
-            .to_string(),
-        ),
-        WireFormat::BedrockConverse => Event::default().data(
-            json!({
-                "modelStreamErrorException": {
-                    "message": message,
                 }
             })
             .to_string(),

@@ -8,7 +8,6 @@
 //! servers, Python objects, or FFI bindings.
 
 pub mod codecs;
-pub(crate) mod codex_custom_tools;
 pub(crate) mod codex_namespaces;
 pub mod diagnostic;
 pub mod engine;

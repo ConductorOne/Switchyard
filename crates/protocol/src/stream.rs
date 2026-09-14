@@ -17,11 +17,7 @@ use thiserror::Error;
 use crate::{
     LlmClientError,
     format::FormatId,
-    llm::{
-        AggLlmResponse, CompactionItem, ComputerToolCall, ContentBlock, CustomToolCall,
-        GeneratedImage, HostedToolCall, OpaqueState, PauseTurn, ResponseMetadata, ResponseOutput,
-        ResponseTerminal, Role, StopReason, ToolCall, Usage,
-    },
+    llm::{AggLlmResponse, ContentBlock, ResponseOutput, Role, StopReason, ToolCall, Usage},
 };
 
 /// Status reported for an upstream error delivered inside a streaming body. The
@@ -186,29 +182,6 @@ impl LlmResponse {
     }
 }
 
-/// An encrypted reasoning detail that names its provider item id but carries no payload yet.
-fn is_reasoning_id_announcement(detail: &Value) -> bool {
-    detail.get("type").and_then(Value::as_str) == Some("reasoning.encrypted")
-        && detail.get("data").is_none()
-}
-
-/// Appends a reasoning detail to an accumulated block. A Responses stream decoder announces a
-/// reasoning item's provider id (`{"type": "reasoning.encrypted", "id"}`) before the payload
-/// arrives; the payload detail then replaces that announcement so history holds one detail.
-fn push_reasoning_detail(details: &mut Vec<Value>, detail: Value) {
-    if detail.get("type").and_then(Value::as_str) == Some("reasoning.encrypted")
-        && let Some(id) = detail.get("id").and_then(Value::as_str)
-        && let Some(announcement) = details.iter_mut().find(|existing| {
-            is_reasoning_id_announcement(existing)
-                && existing.get("id").and_then(Value::as_str) == Some(id)
-        })
-    {
-        *announcement = detail;
-        return;
-    }
-    details.push(detail);
-}
-
 impl AggLlmResponse {
     /// Converts a fully-buffered response into a synthetic chunk stream.
     ///
@@ -216,9 +189,9 @@ impl AggLlmResponse {
     /// downstream expects `LlmResponse::Stream` — for instance when `stream: true` was
     /// requested and the algorithm had to aggregate before it could return.
     ///
-    /// This conversion retains semantic output, typed continuation state,
-    /// response metadata, and explicit terminal state. Tool results, input media,
-    /// files, unknown blocks, response extensions, and preservation metadata are omitted.
+    /// This conversion is lossy: only text, reasoning, and tool-call content has
+    /// a synthetic chunk representation. Refusals, tool results, media, files,
+    /// unknown blocks, response extensions, and preservation metadata are omitted.
     pub fn into_stream(self) -> LlmResponseStream {
         let mut chunks: Vec<LlmResponseChunk> = Vec::new();
         chunks.push(LlmResponseChunk::MessageStart {
@@ -249,79 +222,19 @@ impl AggLlmResponse {
                             });
                         }
                     }
-                    ContentBlock::ToolCall(call) => {
+                    ContentBlock::ToolCall(tool) => {
+                        let args = serde_json::to_string(&tool.arguments).unwrap_or_default();
                         chunks.push(LlmResponseChunk::ToolCallDelta {
                             index: tool_call_index,
-                            id: Some(call.id.clone()),
-                            name: Some(call.name.clone()),
-                            arguments_delta: serde_json::to_string(&call.arguments).ok(),
-                        });
-                        chunks.push(LlmResponseChunk::ToolCallDone {
-                            index: tool_call_index,
-                            call,
+                            id: Some(tool.id),
+                            name: Some(tool.name),
+                            arguments_delta: Some(args),
                         });
                         tool_call_index += 1;
                     }
-                    ContentBlock::CustomToolCall(call) => {
-                        chunks.push(LlmResponseChunk::CustomToolCallDelta {
-                            index: tool_call_index,
-                            id: Some(call.id.clone()),
-                            item_id: call.item_id.clone(),
-                            name: Some(call.name.clone()),
-                            input_delta: call.input.clone(),
-                        });
-                        chunks.push(LlmResponseChunk::CustomToolCallDone {
-                            index: tool_call_index,
-                            call,
-                        });
-                        tool_call_index += 1;
-                    }
-                    ContentBlock::ComputerToolCall(call) => {
-                        chunks.push(LlmResponseChunk::ComputerToolCallDone {
-                            index: tool_call_index,
-                            call,
-                        });
-                        tool_call_index += 1;
-                    }
-                    ContentBlock::HostedToolCall(call) => {
-                        chunks.push(LlmResponseChunk::HostedToolCallDone {
-                            index: tool_call_index,
-                            call,
-                        });
-                        tool_call_index += 1;
-                    }
-                    ContentBlock::Refusal { text } => {
-                        chunks.push(LlmResponseChunk::RefusalDelta {
-                            index: output_index,
-                            text: text.clone(),
-                        });
-                        chunks.push(LlmResponseChunk::RefusalDone {
-                            index: output_index,
-                            text,
-                        });
-                    }
-                    ContentBlock::OpaqueState(state) => {
-                        chunks.push(LlmResponseChunk::OpaqueState(state));
-                    }
-                    ContentBlock::Compaction(item) => {
-                        chunks.push(LlmResponseChunk::CompactionDone(item));
-                    }
-                    ContentBlock::GeneratedImage(image) => {
-                        chunks.push(LlmResponseChunk::GeneratedImageDone(image));
-                    }
-                    ContentBlock::PauseTurn(pause) => {
-                        chunks.push(LlmResponseChunk::PauseTurn(pause));
-                    }
-                    // Results and input media do not appear in assistant output streams.
-                    ContentBlock::Image { .. }
-                    | ContentBlock::Audio { .. }
-                    | ContentBlock::Video { .. }
-                    | ContentBlock::File { .. }
-                    | ContentBlock::ToolResult(_)
-                    | ContentBlock::CustomToolResult(_)
-                    | ContentBlock::ComputerToolResult(_)
-                    | ContentBlock::HostedToolResult(_)
-                    | ContentBlock::Unknown { .. } => {}
+                    // Other variants (Image, ToolResult, Refusal, etc.) don't have
+                    // a streaming chunk representation and don't appear in assistant outputs.
+                    _ => {}
                 }
             }
             chunks.push(LlmResponseChunk::MessageStop {
@@ -331,12 +244,6 @@ impl AggLlmResponse {
                         .and_then(|v| v.as_str().map(String::from))
                 }),
             });
-        }
-        if !self.metadata.is_empty() {
-            chunks.push(LlmResponseChunk::ResponseMetadata(self.metadata));
-        }
-        if let Some(terminal) = self.terminal {
-            chunks.push(LlmResponseChunk::ResponseTerminal(terminal));
         }
         chunks.push(LlmResponseChunk::Usage(self.usage));
         Box::pin(futures::stream::iter(
@@ -408,94 +315,6 @@ pub enum LlmResponseChunk {
         /// Fragment of the serialized tool arguments.
         arguments_delta: Option<String>,
     },
-    /// Finalizes a JSON-schema function tool call.
-    ToolCallDone {
-        /// Tool-call index within the response.
-        index: usize,
-        /// Complete tool call.
-        call: ToolCall,
-    },
-    /// Adds free-form input to a custom tool call.
-    CustomToolCallDelta {
-        /// Tool-call index within the response.
-        index: usize,
-        /// Provider call identifier, normally supplied by the first delta.
-        id: Option<String>,
-        /// Provider item identifier, normally supplied by the first delta.
-        item_id: Option<String>,
-        /// Tool name, normally supplied by the first delta.
-        name: Option<String>,
-        /// Free-form input fragment.
-        input_delta: String,
-    },
-    /// Finalizes a free-form input tool call.
-    CustomToolCallDone {
-        /// Tool-call index within the response.
-        index: usize,
-        /// Complete custom tool call.
-        call: CustomToolCall,
-    },
-    /// Finalizes a computer tool call.
-    ComputerToolCallDone {
-        /// Tool-call index within the response.
-        index: usize,
-        /// Complete computer call.
-        call: ComputerToolCall,
-    },
-    /// Finalizes a provider-hosted tool call.
-    HostedToolCallDone {
-        /// Tool-call index within the response.
-        index: usize,
-        /// Complete hosted call.
-        call: HostedToolCall,
-    },
-    /// Starts one reasoning output item.
-    ReasoningStarted {
-        /// Provider output index.
-        index: usize,
-    },
-    /// Finalizes one reasoning output item and its continuation state.
-    ReasoningDone {
-        /// Provider output index.
-        index: usize,
-        /// Complete reasoning text when the provider reports it only at completion.
-        text: Option<String>,
-        /// Bounded opaque state associated with the reasoning item.
-        state: Vec<OpaqueState>,
-    },
-    /// Adds refusal text to one output index.
-    RefusalDelta {
-        /// Provider output index.
-        index: usize,
-        /// Refusal text fragment.
-        text: String,
-    },
-    /// Finalizes a refusal.
-    RefusalDone {
-        /// Provider output index.
-        index: usize,
-        /// Complete refusal text.
-        text: String,
-    },
-    /// Final text for providers that deliver completion text atomically.
-    TextDone {
-        /// Provider output index.
-        index: usize,
-        /// Complete text.
-        text: String,
-    },
-    /// Bounded opaque provider state that does not itself commit semantic output.
-    OpaqueState(OpaqueState),
-    /// Nonsemantic response metadata.
-    ResponseMetadata(ResponseMetadata),
-    /// Final provider-native generated image.
-    GeneratedImageDone(GeneratedImage),
-    /// Final remote compaction result.
-    CompactionDone(CompactionItem),
-    /// Final pause-turn result.
-    PauseTurn(PauseTurn),
-    /// Explicit response terminal state.
-    ResponseTerminal(ResponseTerminal),
     /// Reports token usage, normally near the end of the stream.
     Usage(Usage),
     /// Ends a response message.
@@ -513,52 +332,6 @@ pub enum LlmResponseChunk {
         /// Human-readable upstream failure.
         message: String,
     },
-}
-
-/// Whether a stream chunk commits downstream-visible response semantics.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StreamSemanticClass {
-    /// Metadata, lifecycle, or partial tool state that is safe to discard before commitment.
-    NonSemantic,
-    /// Output that prohibits replay or provider fallback.
-    Semantic,
-}
-
-impl LlmResponseChunk {
-    /// Classifies the chunk for the shared semantic-commitment boundary.
-    pub fn semantic_class(&self) -> StreamSemanticClass {
-        match self {
-            Self::TextDelta { text, .. }
-            | Self::ReasoningDelta { text, .. }
-            | Self::ReasoningDetailsDelta { text, .. }
-            | Self::RefusalDelta { text, .. }
-            | Self::TextDone { text, .. }
-                if !text.is_empty() =>
-            {
-                StreamSemanticClass::Semantic
-            }
-            Self::ReasoningDone {
-                text: Some(text), ..
-            } if !text.is_empty() => StreamSemanticClass::Semantic,
-            Self::RefusalDone { .. }
-            | Self::ToolCallDone { .. }
-            | Self::CustomToolCallDone { .. }
-            | Self::ComputerToolCallDone { .. }
-            | Self::HostedToolCallDone { .. }
-            | Self::GeneratedImageDone(_)
-            | Self::CompactionDone(_)
-            | Self::PauseTurn(_)
-            | Self::MessageStop { .. }
-            | Self::ResponseTerminal(ResponseTerminal::Completed)
-            | Self::ResponseTerminal(ResponseTerminal::Paused(_)) => StreamSemanticClass::Semantic,
-            _ => StreamSemanticClass::NonSemantic,
-        }
-    }
-
-    /// Returns whether this chunk crosses the semantic-commitment boundary.
-    pub fn commits_semantics(&self) -> bool {
-        self.semantic_class() == StreamSemanticClass::Semantic
-    }
 }
 
 /// Folds a sequence of [`LlmResponseChunk`]s into the terminal [`AggLlmResponse`].
@@ -583,14 +356,8 @@ pub struct ResponseAccumulator {
     reasoning: Option<String>,
     reasoning_details: Vec<Value>,
     tool_calls: BTreeMap<usize, PartialToolCall>,
-    custom_tool_calls: BTreeMap<usize, PartialCustomToolCall>,
     usage: Usage,
     stop_reason: Option<StopReason>,
-    refusal: Option<String>,
-    opaque_state: Vec<OpaqueState>,
-    finalized_blocks: Vec<ContentBlock>,
-    metadata: ResponseMetadata,
-    terminal: Option<ResponseTerminal>,
 }
 
 /// A tool call being assembled from streamed [`LlmResponseChunk::ToolCallDelta`]s.
@@ -599,15 +366,6 @@ struct PartialToolCall {
     id: Option<String>,
     name: Option<String>,
     arguments: String,
-}
-
-/// A custom tool call being assembled from streamed input deltas.
-#[derive(Default)]
-struct PartialCustomToolCall {
-    id: Option<String>,
-    item_id: Option<String>,
-    name: Option<String>,
-    input: String,
 }
 
 impl ResponseAccumulator {
@@ -629,39 +387,19 @@ impl ResponseAccumulator {
                 }
             }
             LlmResponseChunk::TextDelta { text, .. } => self.text.push_str(&text),
-            LlmResponseChunk::TextDone { text, .. } => {
-                if self.text.is_empty() {
-                    self.text = text;
-                }
-            }
             LlmResponseChunk::ReasoningDelta { text, .. } => {
                 self.reasoning
                     .get_or_insert_with(String::new)
                     .push_str(&text);
             }
             LlmResponseChunk::ReasoningDetailsDelta { details, text, .. } => {
-                for detail in details {
-                    push_reasoning_detail(&mut self.reasoning_details, detail);
-                }
+                self.reasoning_details.extend(details);
                 if !text.is_empty() {
                     self.reasoning
                         .get_or_insert_with(String::new)
                         .push_str(&text);
                 }
             }
-            LlmResponseChunk::ReasoningStarted { .. } => {}
-            LlmResponseChunk::ReasoningDone { text, state, .. } => {
-                if self.reasoning.as_deref().is_none_or(str::is_empty)
-                    && let Some(text) = text
-                {
-                    self.reasoning = Some(text);
-                }
-                self.opaque_state.extend(state);
-            }
-            LlmResponseChunk::RefusalDelta { text, .. } => {
-                self.refusal.get_or_insert_with(String::new).push_str(&text);
-            }
-            LlmResponseChunk::RefusalDone { text, .. } => self.refusal = Some(text),
             LlmResponseChunk::ToolCallDelta {
                 index,
                 id,
@@ -679,59 +417,6 @@ impl ResponseAccumulator {
                     call.arguments.push_str(&delta);
                 }
             }
-            LlmResponseChunk::ToolCallDone { index, call } => {
-                self.tool_calls.remove(&index);
-                self.finalized_blocks.push(ContentBlock::ToolCall(call));
-            }
-            LlmResponseChunk::CustomToolCallDelta {
-                index,
-                id,
-                item_id,
-                name,
-                input_delta,
-            } => {
-                let call = self.custom_tool_calls.entry(index).or_default();
-                if id.is_some() {
-                    call.id = id;
-                }
-                if item_id.is_some() {
-                    call.item_id = item_id;
-                }
-                if name.is_some() {
-                    call.name = name;
-                }
-                call.input.push_str(&input_delta);
-            }
-            LlmResponseChunk::CustomToolCallDone { index, call } => {
-                self.custom_tool_calls.remove(&index);
-                self.finalized_blocks
-                    .push(ContentBlock::CustomToolCall(call));
-            }
-            LlmResponseChunk::ComputerToolCallDone { call, .. } => self
-                .finalized_blocks
-                .push(ContentBlock::ComputerToolCall(call)),
-            LlmResponseChunk::HostedToolCallDone { call, .. } => self
-                .finalized_blocks
-                .push(ContentBlock::HostedToolCall(call)),
-            LlmResponseChunk::OpaqueState(state) => self.opaque_state.push(state),
-            LlmResponseChunk::ResponseMetadata(metadata) => {
-                if metadata.model_etag.is_some() {
-                    self.metadata.model_etag = metadata.model_etag;
-                }
-                if metadata.turn_state.is_some() {
-                    self.metadata.turn_state = metadata.turn_state;
-                }
-            }
-            LlmResponseChunk::GeneratedImageDone(image) => self
-                .finalized_blocks
-                .push(ContentBlock::GeneratedImage(image)),
-            LlmResponseChunk::CompactionDone(item) => {
-                self.finalized_blocks.push(ContentBlock::Compaction(item));
-            }
-            LlmResponseChunk::PauseTurn(pause) => {
-                self.finalized_blocks.push(ContentBlock::PauseTurn(pause));
-            }
-            LlmResponseChunk::ResponseTerminal(terminal) => self.terminal = Some(terminal),
             LlmResponseChunk::Usage(usage) => self.usage = usage,
             LlmResponseChunk::MessageStop { reason } => {
                 self.stop_reason = Some(stop_reason_from_str(reason.as_deref()));
@@ -740,28 +425,19 @@ impl ResponseAccumulator {
         }
     }
 
-    /// Build the buffered response. Content is ordered reasoning, text, refusal,
-    /// partial calls by index, then finalized typed items.
+    /// Build the buffered response. Content is ordered reasoning, then text, then
+    /// tool calls (by ascending delta index) — a single assistant output.
     pub fn finish(self) -> AggLlmResponse {
         let mut content = Vec::new();
         if self.reasoning.is_some() || !self.reasoning_details.is_empty() {
             content.push(ContentBlock::Reasoning {
                 text: self.reasoning.unwrap_or_default(),
                 signature: None,
-                // An announcement whose payload never arrived is a stream-level hint only.
-                details: self
-                    .reasoning_details
-                    .into_iter()
-                    .filter(|detail| !is_reasoning_id_announcement(detail))
-                    .collect(),
-                openai_chat_field: Default::default(),
+                details: self.reasoning_details,
             });
         }
         if !self.text.is_empty() {
             content.push(ContentBlock::Text { text: self.text });
-        }
-        if let Some(text) = self.refusal {
-            content.push(ContentBlock::Refusal { text });
         }
         for call in self.tool_calls.into_values() {
             content.push(ContentBlock::ToolCall(ToolCall {
@@ -770,16 +446,6 @@ impl ResponseAccumulator {
                 arguments: parse_tool_arguments(&call.arguments),
             }));
         }
-        for call in self.custom_tool_calls.into_values() {
-            content.push(ContentBlock::CustomToolCall(CustomToolCall {
-                id: call.id.unwrap_or_default(),
-                item_id: call.item_id,
-                name: call.name.unwrap_or_default(),
-                input: call.input,
-            }));
-        }
-        content.extend(self.opaque_state.into_iter().map(ContentBlock::OpaqueState));
-        content.extend(self.finalized_blocks);
         AggLlmResponse {
             id: self.id,
             model: self.model,
@@ -789,8 +455,6 @@ impl ResponseAccumulator {
                 stop_reason: self.stop_reason,
             }],
             usage: self.usage,
-            metadata: self.metadata,
-            terminal: self.terminal,
             ..AggLlmResponse::default()
         }
     }
@@ -990,7 +654,6 @@ mod tests {
                     text: "think".to_string(),
                     signature: None,
                     details: Vec::new(),
-                    openai_chat_field: Default::default(),
                 },
                 ContentBlock::Text {
                     text: "answer".to_string(),
@@ -1042,7 +705,6 @@ mod tests {
                     text: "fallback reasoning".to_string(),
                     signature: None,
                     details: details.clone(),
-                    openai_chat_field: Default::default(),
                 }],
                 stop_reason: Some(StopReason::EndTurn),
             }],

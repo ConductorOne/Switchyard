@@ -7,7 +7,6 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use thiserror::Error;
 
 use crate::format::FormatId;
 
@@ -73,27 +72,6 @@ impl Message {
     }
 }
 
-/// Wire-level field used for OpenAI Chat plaintext reasoning.
-///
-/// The two names are provider dialects rather than interchangeable aliases:
-/// callers may need to replay the exact field returned by a model.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OpenAiChatReasoningField {
-    /// The `reasoning` field.
-    #[default]
-    Reasoning,
-    /// The `reasoning_content` field.
-    ReasoningContent,
-}
-
-impl OpenAiChatReasoningField {
-    /// Returns true when the field uses the historical default spelling.
-    pub const fn is_default(&self) -> bool {
-        matches!(self, Self::Reasoning)
-    }
-}
-
 /// Normalized content block variants carried by messages and tool results.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -113,9 +91,6 @@ pub enum ContentBlock {
         /// "reasoning.encrypted", "data": "..." }` object, replayed without modification.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         details: Vec<Value>,
-        /// OpenAI Chat field that carried plaintext reasoning.
-        #[serde(default, skip_serializing_if = "OpenAiChatReasoningField::is_default")]
-        openai_chat_field: OpenAiChatReasoningField,
     },
     /// Image content.
     Image {
@@ -141,26 +116,6 @@ pub enum ContentBlock {
     ToolCall(ToolCall),
     /// Result of an earlier tool invocation.
     ToolResult(ToolResult),
-    /// Free-form input tool invocation requested by the assistant.
-    CustomToolCall(CustomToolCall),
-    /// Result of an earlier free-form input tool invocation.
-    CustomToolResult(CustomToolResult),
-    /// Computer interaction requested by the assistant.
-    ComputerToolCall(ComputerToolCall),
-    /// Screenshot and safety acknowledgements returned after computer interaction.
-    ComputerToolResult(ComputerToolResult),
-    /// Provider-hosted tool invocation requested by the assistant.
-    HostedToolCall(HostedToolCall),
-    /// Result produced by a provider-hosted tool.
-    HostedToolResult(HostedToolResult),
-    /// Bounded opaque state retained for a later request.
-    OpaqueState(OpaqueState),
-    /// Provider-created conversation compaction state.
-    Compaction(CompactionItem),
-    /// A provider-native generated image.
-    GeneratedImage(GeneratedImage),
-    /// A provider pause that requires another turn instead of ordinary completion.
-    PauseTurn(PauseTurn),
     /// Provider refusal content.
     Refusal {
         /// Human-readable refusal text.
@@ -258,260 +213,6 @@ pub struct ToolResult {
     pub is_error: Option<bool>,
 }
 
-/// Free-form input tool invocation.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct CustomToolCall {
-    /// Provider tool-call identifier used to pair the result.
-    pub id: String,
-    /// Provider item identifier, when the protocol distinguishes items from calls.
-    pub item_id: Option<String>,
-    /// Tool name.
-    pub name: String,
-    /// Unparsed text input supplied to the tool.
-    pub input: String,
-}
-
-/// Result of an earlier [`CustomToolCall`].
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct CustomToolResult {
-    /// Identifier of the custom tool call this result answers.
-    pub tool_call_id: String,
-    /// Text returned by the tool.
-    pub output: String,
-    /// Whether tool execution failed, when reported.
-    pub is_error: Option<bool>,
-}
-
-/// Screen geometry and environment exposed to a computer tool.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ComputerToolConfig {
-    /// Width of the interactive surface in pixels.
-    pub display_width: u32,
-    /// Height of the interactive surface in pixels.
-    pub display_height: u32,
-    /// Kind of interactive surface.
-    pub environment: ComputerEnvironment,
-}
-
-/// Kind of interactive surface exposed to a computer tool.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ComputerEnvironment {
-    /// Browser viewport.
-    Browser,
-    /// Desktop session.
-    Desktop,
-    /// Mobile-device session.
-    Mobile,
-}
-
-/// Coordinate on a computer tool's interactive surface.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ComputerPoint {
-    /// Horizontal coordinate.
-    pub x: i64,
-    /// Vertical coordinate.
-    pub y: i64,
-}
-
-/// Mouse button used by a computer action.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ComputerMouseButton {
-    /// Primary mouse button.
-    Left,
-    /// Middle mouse button.
-    Middle,
-    /// Secondary mouse button.
-    Right,
-}
-
-/// One provider-neutral computer interaction.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ComputerAction {
-    /// Click one point.
-    Click {
-        /// Click location.
-        point: ComputerPoint,
-        /// Mouse button to click.
-        button: ComputerMouseButton,
-    },
-    /// Double-click one point.
-    DoubleClick {
-        /// Click location.
-        point: ComputerPoint,
-        /// Mouse button to click.
-        button: ComputerMouseButton,
-    },
-    /// Drag through an ordered path.
-    Drag {
-        /// Ordered drag path.
-        path: Vec<ComputerPoint>,
-    },
-    /// Press one or more keys together.
-    KeyPress {
-        /// Provider-neutral key names.
-        keys: Vec<String>,
-    },
-    /// Move the pointer without clicking.
-    Move {
-        /// Destination.
-        point: ComputerPoint,
-    },
-    /// Request a screenshot without another interaction.
-    Screenshot,
-    /// Scroll at a point.
-    Scroll {
-        /// Pointer location for the scroll.
-        point: ComputerPoint,
-        /// Horizontal scroll distance.
-        delta_x: i64,
-        /// Vertical scroll distance.
-        delta_y: i64,
-    },
-    /// Enter literal text.
-    Type {
-        /// Text to enter.
-        text: String,
-    },
-    /// Wait for the remote surface.
-    Wait,
-}
-
-/// One safety check attached to a computer action.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ComputerSafetyCheck {
-    /// Stable identifier echoed when the check is acknowledged.
-    pub id: String,
-    /// Human-readable check description.
-    pub description: String,
-}
-
-/// Computer actions requested by the assistant.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ComputerToolCall {
-    /// Provider tool-call identifier used to pair the result.
-    pub id: String,
-    /// Provider item identifier, when supplied.
-    pub item_id: Option<String>,
-    /// Ordered actions to perform.
-    pub actions: Vec<ComputerAction>,
-    /// Checks that must be acknowledged before executing the actions.
-    pub pending_safety_checks: Vec<ComputerSafetyCheck>,
-}
-
-/// Result of an earlier [`ComputerToolCall`].
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ComputerToolResult {
-    /// Identifier of the computer tool call this result answers.
-    pub tool_call_id: String,
-    /// Screenshot or other native image returned after executing the action.
-    pub output: ImageSource,
-    /// Safety checks acknowledged by the executor.
-    pub acknowledged_safety_checks: Vec<String>,
-}
-
-/// A provider-hosted tool capability.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum HostedTool {
-    /// Search public web content.
-    WebSearch {
-        /// Optional allowlist of domains.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        allowed_domains: Vec<String>,
-    },
-    /// Search provider-managed files.
-    FileSearch {
-        /// Provider-managed collection identifiers.
-        vector_store_ids: Vec<String>,
-        /// Maximum result count, when constrained.
-        max_results: Option<u32>,
-    },
-    /// Execute code in a provider-managed container.
-    CodeInterpreter {
-        /// Existing container identifier, when one is reused.
-        container_id: Option<String>,
-    },
-    /// Generate an image.
-    ImageGeneration,
-}
-
-/// Invocation of a provider-hosted tool.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct HostedToolCall {
-    /// Provider call identifier.
-    pub id: String,
-    /// Provider item identifier, when supplied.
-    pub item_id: Option<String>,
-    /// Hosted capability being invoked.
-    pub tool: HostedTool,
-    /// Capability arguments expressed by the neutral JSON input contract.
-    pub arguments: Value,
-}
-
-/// Result of an earlier [`HostedToolCall`].
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct HostedToolResult {
-    /// Identifier of the hosted tool call this result answers.
-    pub tool_call_id: String,
-    /// Ordered typed output content.
-    pub content: Vec<ContentBlock>,
-    /// Whether hosted execution failed, when reported.
-    pub is_error: Option<bool>,
-}
-
-/// Grammar accepted by a free-form input tool.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum CustomToolFormat {
-    /// Unconstrained text.
-    Text,
-    /// Input constrained by a grammar.
-    Grammar {
-        /// Grammar language.
-        syntax: GrammarSyntax,
-        /// Grammar definition.
-        definition: String,
-    },
-}
-
-/// Supported grammar languages for free-form tools.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GrammarSyntax {
-    /// Lark grammar.
-    Lark,
-    /// Regular expression.
-    Regex,
-}
-
-/// Provider-neutral declaration for a non-function tool.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum SpecializedToolDefinition {
-    /// Free-form input tool.
-    Custom {
-        /// Tool name exposed to the model.
-        name: String,
-        /// Human-readable tool description.
-        description: Option<String>,
-        /// Accepted free-form input.
-        format: CustomToolFormat,
-    },
-    /// Computer interaction tool.
-    Computer {
-        /// Screen and environment exposed to the model.
-        configuration: ComputerToolConfig,
-    },
-    /// Provider-hosted capability.
-    Hosted {
-        /// Capability exposed to the model.
-        tool: HostedTool,
-    },
-}
-
 /// Normalized tool definition.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolDefinition {
@@ -573,192 +274,6 @@ pub struct ReasoningParams {
     pub raw: Option<Value>,
 }
 
-/// Purpose of encrypted or otherwise opaque provider state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OpaqueStatePurpose {
-    /// Encrypted reasoning continuation state.
-    Reasoning,
-    /// Conversation continuation state.
-    Conversation,
-    /// Remote compaction state.
-    Compaction,
-    /// Within-turn routing state.
-    TurnRouting,
-}
-
-/// Error returned when opaque provider state exceeds its protocol bound.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-#[error("opaque provider state exceeds {MAX_OPAQUE_STATE_BYTES} bytes")]
-pub struct OpaqueStateTooLarge;
-
-/// Maximum encoded size of one opaque provider state value.
-pub const MAX_OPAQUE_STATE_BYTES: usize = 1024 * 1024;
-
-/// Bounded opaque state that can be replayed without exposing provider spellings.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct OpaqueState {
-    purpose: OpaqueStatePurpose,
-    data: String,
-}
-
-impl OpaqueState {
-    /// Creates bounded opaque state.
-    pub fn new(
-        purpose: OpaqueStatePurpose,
-        data: impl Into<String>,
-    ) -> Result<Self, OpaqueStateTooLarge> {
-        let data = data.into();
-        if data.len() > MAX_OPAQUE_STATE_BYTES {
-            return Err(OpaqueStateTooLarge);
-        }
-        Ok(Self { purpose, data })
-    }
-
-    /// Purpose of this state.
-    pub fn purpose(&self) -> OpaqueStatePurpose {
-        self.purpose
-    }
-
-    /// Encoded state value.
-    pub fn data(&self) -> &str {
-        &self.data
-    }
-}
-
-impl<'de> Deserialize<'de> for OpaqueState {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct Repr {
-            purpose: OpaqueStatePurpose,
-            data: String,
-        }
-
-        let repr = Repr::deserialize(deserializer)?;
-        Self::new(repr.purpose, repr.data).map_err(serde::de::Error::custom)
-    }
-}
-
-/// Provider-created conversation compaction output.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CompactionItem {
-    /// Provider item identifier, when supplied.
-    pub id: Option<String>,
-    /// Human-readable summary, when this compaction form exposes one.
-    pub summary: Option<String>,
-    /// Opaque continuation state, when this compaction form is encrypted.
-    pub state: Option<OpaqueState>,
-}
-
-/// Provider-native generated image output.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct GeneratedImage {
-    /// Provider item identifier, when supplied.
-    pub id: Option<String>,
-    /// Generated image location or inline payload.
-    pub source: ImageSource,
-}
-
-/// Update to a turn's generation configuration.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct TurnConfigurationUpdate {
-    /// New reasoning effort, when changed.
-    pub reasoning_effort: Option<String>,
-    /// New response verbosity, when changed.
-    pub text_verbosity: Option<String>,
-}
-
-/// A provider pause that requires another request to continue the turn.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct PauseTurn {
-    /// Stable continuation identifier, when supplied.
-    pub continuation_id: Option<String>,
-    /// Safe provider-neutral reason, when supplied.
-    pub reason: Option<String>,
-}
-
-/// Non-message input appended to a turn in order.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "snake_case")]
-pub enum TurnInputItem {
-    /// Change turn configuration after the preceding conversation items.
-    ConfigurationUpdate(TurnConfigurationUpdate),
-    /// Request provider-native remote compaction as the final turn item.
-    RemoteCompaction,
-}
-
-/// Safe provider error classification.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderErrorClass {
-    /// Credential was not accepted.
-    Authentication,
-    /// Credential was valid but lacked authority.
-    Authorization,
-    /// Provider rate limit.
-    RateLimited,
-    /// Request violated the provider contract.
-    InvalidRequest,
-    /// Request exceeded the model context window.
-    ContextWindow,
-    /// Provider safety policy rejected content.
-    ContentFiltered,
-    /// Provider or dependency was unavailable.
-    Unavailable,
-    /// Provider response violated the expected protocol.
-    Protocol,
-    /// Provider reported an internal failure.
-    Internal,
-}
-
-/// Structured, body-free provider error.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct StructuredProviderError {
-    /// Stable provider-neutral classification.
-    pub class: ProviderErrorClass,
-    /// HTTP status, when the failure came from HTTP.
-    pub status: Option<u16>,
-    /// Bounded safe provider code, when allowlisted by an adapter.
-    pub code: Option<String>,
-    /// Provider-advertised retry delay.
-    pub retry_after_ms: Option<u64>,
-}
-
-/// Provider-neutral response terminal state.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "snake_case")]
-pub enum ResponseTerminal {
-    /// Response completed successfully.
-    Completed,
-    /// Response ended without completing.
-    Incomplete {
-        /// Safe provider-neutral reason, when supplied.
-        reason: Option<String>,
-    },
-    /// Response failed with a structured body-free error.
-    Failed(StructuredProviderError),
-    /// Provider paused the turn for explicit continuation.
-    Paused(PauseTurn),
-}
-
-/// Nonsemantic response metadata retained across compatible requests.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ResponseMetadata {
-    /// Model-catalog entity tag returned by the provider.
-    pub model_etag: Option<String>,
-    /// Bounded within-turn routing state.
-    pub turn_state: Option<OpaqueState>,
-}
-
-impl ResponseMetadata {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.model_etag.is_none() && self.turn_state.is_none()
-    }
-}
-
 /// Provider-specific fields that do not have first-class conversation fields.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -798,14 +313,8 @@ pub struct LlmRequest {
     pub instructions: Vec<InstructionBlock>,
     /// Ordered conversation messages.
     pub messages: Vec<Message>,
-    /// Ordered non-message items appended after the conversation.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub trailing_items: Vec<TurnInputItem>,
     /// Tools available to the model.
     pub tools: Vec<ToolDefinition>,
-    /// Non-function tools available to the model.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub specialized_tools: Vec<SpecializedToolDefinition>,
     /// Policy controlling model tool selection.
     pub tool_choice: Option<ToolChoice>,
     /// Common sampling controls.
@@ -939,12 +448,6 @@ pub struct AggLlmResponse {
     pub outputs: Vec<ResponseOutput>,
     /// Normalized token usage.
     pub usage: Usage,
-    /// Nonsemantic response metadata.
-    #[serde(default, skip_serializing_if = "ResponseMetadata::is_empty")]
-    pub metadata: ResponseMetadata,
-    /// Provider-neutral terminal state, when explicitly reported.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub terminal: Option<ResponseTerminal>,
     /// Provider response fields without normalized equivalents.
     pub extensions: ProviderExtensions,
     /// Exact provider bodies retained for lossless round trips.

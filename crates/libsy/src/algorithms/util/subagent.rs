@@ -78,7 +78,7 @@ where
         &self,
         state: &mut S,
         request: &mut Request,
-        driver: &Driver,
+        driver: Option<&Driver>,
     ) -> Result<(Classification, Option<Response>)> {
         if !request
             .metadata
@@ -123,7 +123,7 @@ where
         &self,
         _state: &mut S,
         request: &mut Request,
-        driver: &Driver,
+        _driver: Option<&Driver>,
     ) -> Result<(Classification, Option<Response>)> {
         // Delegated *work* only. A harness maintenance turn (e.g. Codex `compact`) carries
         // sub-agent lineage but is not delegated work, so it abstains and routes normally.
@@ -131,15 +131,11 @@ where
             .metadata
             .as_ref()
             .is_some_and(Metadata::is_subagent_work);
-        if is_delegated_work {
-            driver.set_evidence(serde_json::json!({"source": "subagent"}));
-        }
         Ok((
             Classification::Scores(if is_delegated_work {
                 vec![Score {
                     confidence: 1.0,
                     target: self.worker.clone(),
-                    category: None,
                 }]
             } else {
                 Vec::new()
@@ -152,7 +148,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::testing::empty_driver;
     use parking_lot::Mutex;
     use switchyard_protocol::{slice_to_header_map, text_request};
 
@@ -167,14 +162,13 @@ mod tests {
             &self,
             _state: &mut (),
             request: &mut Request,
-            _driver: &Driver,
+            _driver: Option<&Driver>,
         ) -> Result<(Classification, Option<Response>)> {
             self.requests.lock().push(request.clone());
             Ok((
                 Classification::Scores(vec![Score {
                     confidence: 1.0,
                     target: ModelId::from("worker"),
-                    category: None,
                 }]),
                 None,
             ))
@@ -195,7 +189,7 @@ mod tests {
     async fn selected(headers: &[(&str, &str)]) -> Result<Option<ModelId>> {
         let mut state = ();
         let classification = SubagentOverride::new("worker")
-            .score(&mut state, &mut request(headers), &empty_driver())
+            .score(&mut state, &mut request(headers), None)
             .await?;
         Ok(classification.0.argmax(false)?.map(|score| score.target))
     }
@@ -246,7 +240,7 @@ mod tests {
             .score(
                 &mut state,
                 &mut request(&[("x-openai-subagent", "review")]),
-                &empty_driver(),
+                None,
             )
             .await?;
         match classification.0 {
@@ -267,9 +261,7 @@ mod tests {
         request.llm_request.messages = vec![Message::text(Role::Assistant, "no user prompt")];
 
         let mut state = ();
-        let (classification, response) = gate
-            .score(&mut state, &mut request, &empty_driver())
-            .await?;
+        let (classification, response) = gate.score(&mut state, &mut request, None).await?;
 
         assert!(classification.argmax(false)?.is_none());
         assert!(response.is_none());
