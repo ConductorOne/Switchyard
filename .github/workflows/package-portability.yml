@@ -14,7 +14,7 @@ on:
       - "switchyard/**"
       - "switchyard_rust/**"
   push:
-    branches: [main]
+    branches: [conductorone/main]
     paths:
       - ".github/workflows/package-portability.yml"
       - ".github/workflows/publish.yml"
