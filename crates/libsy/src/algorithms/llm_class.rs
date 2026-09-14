@@ -1517,6 +1517,7 @@ mod tests {
                         text: "private chain of thought".to_string(),
                         signature: None,
                         details: Vec::new(),
+                        openai_chat_field: Default::default(),
                     },
                     ContentBlock::Text {
                         text: "visible answer".to_string(),
@@ -1531,6 +1532,7 @@ mod tests {
                     text: "reasoning-only turn".to_string(),
                     signature: None,
                     details: Vec::new(),
+                    openai_chat_field: Default::default(),
                 }],
             },
             Message::text(Role::User, "follow-up"),

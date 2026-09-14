@@ -1298,6 +1298,44 @@ fn responses_reasoning_item_merges_into_next_assistant_message_for_openai_chat()
     Ok(())
 }
 
+// Ensures a normalized OpenAI Chat request preserves the reasoning field emitted
+// by the assistant when exact same-format replay is unavailable.
+#[test]
+fn openai_chat_reencodes_reasoning_content_after_exact_replay_is_invalidated() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "model": "reasoning-model",
+        "messages": [
+            {"role": "user", "content": "Continue."},
+            {
+                "role": "assistant",
+                "content": "Visible answer",
+                "reasoning_content": "Historical reasoning"
+            }
+        ]
+    });
+
+    let mut request = engine
+        .decode_request(WireFormat::OpenAiChat, &body, &TranslationPolicy::default())?
+        .request;
+    request.preservation.requests.clear();
+
+    let output = engine
+        .encode_request(
+            WireFormat::OpenAiChat,
+            &request,
+            &TranslationPolicy::default(),
+        )?
+        .body;
+
+    assert_eq!(
+        output["messages"][1]["reasoning_content"],
+        "Historical reasoning"
+    );
+    assert!(output["messages"][1].get("reasoning").is_none());
+    Ok(())
+}
+
 #[test]
 fn openai_chat_reasoning_details_round_trip_in_assistant_history() -> TestResult {
     let engine = TranslationEngine::default();

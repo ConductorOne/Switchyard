@@ -464,6 +464,7 @@ impl ResponseAccumulator {
                     .into_iter()
                     .filter(|detail| !is_reasoning_id_announcement(detail))
                     .collect(),
+                openai_chat_field: Default::default(),
             });
         }
         if !self.text.is_empty() {
@@ -684,6 +685,7 @@ mod tests {
                     text: "think".to_string(),
                     signature: None,
                     details: Vec::new(),
+                    openai_chat_field: Default::default(),
                 },
                 ContentBlock::Text {
                     text: "answer".to_string(),
@@ -735,6 +737,7 @@ mod tests {
                     text: "fallback reasoning".to_string(),
                     signature: None,
                     details: details.clone(),
+                    openai_chat_field: Default::default(),
                 }],
                 stop_reason: Some(StopReason::EndTurn),
             }],
