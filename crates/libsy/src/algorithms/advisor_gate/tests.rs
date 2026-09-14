@@ -123,6 +123,7 @@ fn reasoning_only_turn() -> Response {
                     text: "thinking about it".to_string(),
                     signature: None,
                     details: Vec::new(),
+                    openai_chat_field: Default::default(),
                 }],
                 stop_reason: None,
             }],

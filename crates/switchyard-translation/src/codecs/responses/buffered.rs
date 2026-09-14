@@ -761,6 +761,7 @@ fn decode_responses_reasoning_item(item: &Map<String, Value>) -> Vec<ContentBloc
         text: parts.join("\n"),
         signature: None,
         details,
+        openai_chat_field: Default::default(),
     }]
 }
 
@@ -800,6 +801,7 @@ fn decode_responses_content(value: &Value) -> Vec<ContentBlock> {
                                 .to_string(),
                             signature: None,
                             details: Vec::new(),
+                            openai_chat_field: Default::default(),
                         });
                     }
                     Some("input_image") => {
@@ -1282,6 +1284,7 @@ fn encode_responses_special_input(
             text,
             signature: None,
             details,
+            ..
         } => encode_responses_reasoning_input(text, details),
         ContentBlock::ToolCall(call) if custom_tools.contains(&call.name) => {
             // A freeform tool call replays as `custom_tool_call` with its raw input.

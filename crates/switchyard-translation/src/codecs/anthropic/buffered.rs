@@ -589,6 +589,7 @@ fn decode_anthropic_content_block(
                 .filter(|signature| !signature.is_empty())
                 .map(ToOwned::to_owned),
             details: Vec::new(),
+            openai_chat_field: Default::default(),
         }],
         Some("tool_use") => vec![ContentBlock::ToolCall(ToolCall {
             id: block
