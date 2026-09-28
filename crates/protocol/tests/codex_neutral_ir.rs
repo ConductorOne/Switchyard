@@ -493,6 +493,7 @@ fn codex_parity_fixture_needs_no_escape_hatches() -> TestResult {
         outputs: vec![ResponseOutput {
             role: Role::Assistant,
             content: blocks,
+            url_citations: Vec::new(),
             stop_reason: None,
         }],
         metadata,

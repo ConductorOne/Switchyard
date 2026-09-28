@@ -236,6 +236,7 @@ impl FormatCodec for BedrockConverseCodec {
                     _ => Role::Assistant,
                 },
                 content,
+                url_citations: Vec::new(),
                 stop_reason,
             })
             .into_iter()
