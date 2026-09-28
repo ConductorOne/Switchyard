@@ -367,7 +367,7 @@ fn push_checked_chunk(
 /// One provider-neutral streaming response chunk.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum LlmResponseChunk {
-    /// Starts a response message.
+    /// Starts a response message, or fills in identity first supplied by a later frame.
     MessageStart {
         /// Provider response identifier.
         id: Option<String>,
@@ -786,6 +786,7 @@ impl ResponseAccumulator {
             outputs: vec![ResponseOutput {
                 role: Role::Assistant,
                 content,
+                url_citations: Vec::new(),
                 stop_reason: self.stop_reason,
             }],
             usage: self.usage,
@@ -1009,6 +1010,7 @@ mod tests {
                 content: vec![ContentBlock::Text {
                     text: "hello".to_string(),
                 }],
+                url_citations: Vec::new(),
                 stop_reason: Some(StopReason::EndTurn),
             }],
             usage: Usage {
@@ -1044,6 +1046,7 @@ mod tests {
                     details: details.clone(),
                     openai_chat_field: Default::default(),
                 }],
+                url_citations: Vec::new(),
                 stop_reason: Some(StopReason::EndTurn),
             }],
             ..AggLlmResponse::default()

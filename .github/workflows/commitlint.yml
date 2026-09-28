@@ -19,6 +19,30 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: wagoid/commitlint-github-action@v6
+      - uses: actions/setup-node@v4
         with:
-          configFile: .commitlintrc.json
+          node-version: "22"
+      - name: Fetch upstream commit lineage
+        run: |
+          git fetch --no-tags https://github.com/NVIDIA-NeMo/Switchyard.git \
+            +refs/heads/main:refs/remotes/upstream/main
+      - name: Install commitlint
+        run: npm install --no-save --no-package-lock --ignore-scripts @commitlint/cli@20.4.1 @commitlint/config-conventional@20.4.1
+      - name: Lint fork-authored commit messages
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          # Only upstream's actual commit ancestry is exempt. All new fork
+          # commits, including integration merges, must pass the same rules.
+          if [[ "$BASE_SHA" =~ ^0+$ ]]; then
+            git rev-list --reverse "$HEAD_SHA" --not refs/remotes/upstream/main > "$RUNNER_TEMP/fork-commits"
+          else
+            git rev-list --reverse "$BASE_SHA..$HEAD_SHA" --not refs/remotes/upstream/main > "$RUNNER_TEMP/fork-commits"
+          fi
+          while IFS= read -r commit; do
+            echo "Linting $commit"
+            git show -s --format=%B "$commit" |
+              ./node_modules/.bin/commitlint --config .commitlintrc.json
+          done < "$RUNNER_TEMP/fork-commits"
