@@ -16,6 +16,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   candidate fallback without inferring policy from HTTP status. Exhausted
   provider-target summaries retain attempted/bypassed counts and failure classes.
 
+### Fixed
+
+- Fork commit-message CI lints new fork-authored commits while excluding commits
+  present in NVIDIA-NeMo/Switchyard `main`; upstream imports no longer fail the
+  fork gate on historical upstream messages.
+
 ## [0.3.0]
 
 Switchyard 0.3.0 builds on the native server and Rust library introduced in
