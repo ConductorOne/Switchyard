@@ -111,10 +111,71 @@ pub struct CallModel {
     pub models: Vec<ModelId>,
     /// How to send the response back to the algorithm. `None` once the call is recorded.
     reply: Option<oneshot::Sender<Result<Response>>>,
+    /// Where the algorithm reports whether the reply was usable, for calls that assess it.
+    assessment: Option<oneshot::Receiver<CallAssessment>>,
     started: Instant,
 }
 
+/// What an algorithm concluded about the reply to one of its routing-time calls.
+///
+/// A provider can answer successfully with a reply the algorithm cannot use, such as a judge
+/// verdict that does not parse. Hosts that audit calls read this to keep the two apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallAssessment {
+    /// The reply drove the algorithm's decision.
+    Usable,
+    /// The reply could not be used. `reason` is a stable, content-free code.
+    Unusable {
+        /// Why the reply was unusable, e.g. `truncated_json` or `verdict_rejected`.
+        reason: &'static str,
+    },
+}
+
+/// The state of a [`CallAssessment`] the host is waiting for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AssessmentState {
+    /// The algorithm reported its assessment.
+    Reported(CallAssessment),
+    /// The algorithm may still report.
+    Pending,
+    /// The algorithm finished with the call without reporting.
+    NotReported,
+}
+
+/// The host's end of one call's assessment, taken with [`CallModel::take_assessment`].
+#[derive(Debug)]
+pub struct CallAssessmentReceiver(oneshot::Receiver<CallAssessment>);
+
+impl CallAssessmentReceiver {
+    /// Reads the assessment without waiting.
+    pub fn try_take(&mut self) -> AssessmentState {
+        match self.0.try_recv() {
+            Ok(assessment) => AssessmentState::Reported(assessment),
+            Err(oneshot::error::TryRecvError::Empty) => AssessmentState::Pending,
+            Err(oneshot::error::TryRecvError::Closed) => AssessmentState::NotReported,
+        }
+    }
+}
+
+/// The algorithm's end of one call's assessment. Dropping it unreported tells the host
+/// nothing was concluded.
+pub(crate) struct CallAssessor(oneshot::Sender<CallAssessment>);
+
+impl CallAssessor {
+    pub(crate) fn report(self, assessment: CallAssessment) {
+        // The host may have stopped listening; the routing decision does not depend on it.
+        let _ = self.0.send(assessment);
+    }
+}
+
 impl CallModel {
+    /// Takes the channel on which the algorithm reports whether this call's reply was usable.
+    /// `None` when the algorithm does not assess this call. Take it before
+    /// [`respond`](Self::respond): the report arrives after the algorithm reads the reply.
+    pub fn take_assessment(&mut self) -> Option<CallAssessmentReceiver> {
+        self.assessment.take().map(CallAssessmentReceiver)
+    }
+
     /// Fulfill the promise with the caller's model-call result. Pass `Err(..)` to
     /// propagate a failed model call back to the algorithm. Consumes the promise: it
     /// can only be fulfilled once.
@@ -275,6 +336,22 @@ impl Driver {
     /// through [`CallModel::respond`] or [`CallModel::fail`]; outcome and token usage
     /// are recorded on the span when the promise resolves. The provider call itself is the
     /// host's, and is instrumented by whoever makes it.
+    pub async fn call_model(&self, request: Request, models: Vec<ModelId>) -> Result<Response> {
+        self.publish_call(request, models, None).await
+    }
+
+    /// Like [`call_model`](Self::call_model), but also returns the handle on which the caller
+    /// reports whether the reply was usable.
+    pub(crate) async fn call_model_assessed(
+        &self,
+        request: Request,
+        models: Vec<ModelId>,
+    ) -> Result<(Response, CallAssessor)> {
+        let (assessor, assessment) = oneshot::channel();
+        let response = self.publish_call(request, models, Some(assessment)).await?;
+        Ok((response, CallAssessor(assessor)))
+    }
+
     #[tracing::instrument(
         target = "libsy",
         name = "libsy.llm_call",
@@ -290,7 +367,12 @@ impl Driver {
             reasoning_tokens = tracing::field::Empty,
         )
     )]
-    pub async fn call_model(&self, mut request: Request, models: Vec<ModelId>) -> Result<Response> {
+    async fn publish_call(
+        &self,
+        mut request: Request,
+        models: Vec<ModelId>,
+        assessment: Option<oneshot::Receiver<CallAssessment>>,
+    ) -> Result<Response> {
         let Some(selected_model_id) = models.first() else {
             return Err(LibsyError::NoTargets);
         };
@@ -302,6 +384,7 @@ impl Driver {
             request,
             models,
             reply: Some(reply),
+            assessment,
             started,
         };
         let result = async {

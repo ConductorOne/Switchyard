@@ -17,10 +17,11 @@ use switchyard_protocol::{
     completion_text,
 };
 
+use super::judge_diagnostics::{ReplyShape, diagnose_parse};
 use super::robustness::{safe_client_error, safe_error_summary};
 
 use super::classifier_contract::ClassifierContract;
-use crate::core::algorithm::Driver;
+use crate::core::algorithm::{CallAssessment, CallAssessor, Driver};
 use crate::core::classifier::{Classification, Classifier};
 use crate::core::state::State;
 use crate::{LibsyError, Result};
@@ -180,6 +181,10 @@ where
     fn parse(&self, response: &AggLlmResponse) -> Result<Self::Verdict> {
         self.decoder.decode(response, &self.contract)
     }
+
+    fn response_schema(&self) -> Option<&Value> {
+        Some(self.contract.schema())
+    }
 }
 
 /// Builds and parses requests for one algorithm-specific LLM judge.
@@ -190,6 +195,12 @@ pub trait Judge: Send + Sync {
 
     fn parse(&self, response: &AggLlmResponse) -> Result<Self::Verdict> {
         parse_json_verdict(response)
+    }
+
+    /// The JSON Schema a verdict must match. Rejected replies are checked against it so
+    /// logs can name missing or mistyped schema fields.
+    fn response_schema(&self) -> Option<&Value> {
+        None
     }
 }
 
@@ -239,13 +250,29 @@ where
         self
     }
 
-    /// Adds fail-open evidence only for evidence-enabled judges and preserves an earlier decision.
+    /// Logs and counts a judge call that failed before it produced a reply.
+    /// `error` must already be redacted: `LlmClientError::UpstreamHttp`'s `Display` interpolates
+    /// the raw upstream body, which can quote the conversation back. Callers pass a
+    /// `robustness::safe_*` summary rather than the error itself.
     fn report_fail_open(&self, driver: &Driver, error: String, reason: &'static str) {
         let judge_target = driver
             .first_model_for(&Category::Judge)
             .map(|c| c.as_str())
             .unwrap_or("missing");
-        report_fail_open(judge_target, error, reason);
+        tracing::warn!(
+            target: "libsy",
+            judge_model = judge_target,
+            reason,
+            error = %error,
+            "judge verdict unavailable; routing without one"
+        );
+        self.record_fail_open(driver, judge_target, reason);
+    }
+
+    /// Counts a fail-open. Evidence is added only for evidence-enabled judges and never
+    /// replaces an earlier decision.
+    fn record_fail_open(&self, driver: &Driver, judge_model: &str, reason: &'static str) {
+        crate::observability::record_classifier_fail_open(judge_model, reason);
         if self.evidence.is_some() {
             driver.set_evidence_if_empty(serde_json::json!({
                 "source": "fail_open",
@@ -261,56 +288,90 @@ where
     /// mid-stream, or unparseable reply — is logged and folded into `None` for the policy's
     /// fallback branch. A closed driver stream is folded too; the algorithm's next driver
     /// call surfaces it, so nothing is masked.
+    ///
+    /// An unusable reply is reported to the host here. A parsed verdict comes back with the
+    /// handle for that report, because only the policy can say whether it was usable.
     async fn verdict(
         &self,
         state: &mut State,
         request: &Request,
         driver: &Driver,
         judge_models: &[ModelId],
-    ) -> Option<J::Verdict> {
+    ) -> Option<(J::Verdict, CallAssessor)> {
         let judge_model = judge_models.first()?.as_str();
 
         tracing::info!(target = judge_model, "consulting llm judge");
-        let response = driver
-            .call_model(
-                self.judge.build_request(state, request),
-                judge_models.to_vec(),
-            )
+        let judge_request = self.judge.build_request(state, request);
+        let requested_max_output_tokens = judge_request.llm_request.output.max_output_tokens;
+        let (response, assessor) = driver
+            .call_model_assessed(judge_request, judge_models.to_vec())
             .await
             .inspect_err(|error| {
                 self.report_fail_open(driver, safe_error_summary(error), libsy_error_reason(error));
             })
             .ok()?;
-        let aggregate = response
-            .llm_response
-            .into_agg()
-            .await
-            .inspect_err(|error| {
-                self.report_fail_open(driver, safe_client_error(error), client_error_reason(error));
-            })
-            .ok()?;
-        self.judge
-            .parse(&aggregate)
-            .inspect_err(|error| {
-                self.report_fail_open(driver, safe_error_summary(error), "parse_error");
-            })
-            .ok()
+        let aggregate = response.llm_response.into_agg().await.inspect_err(|error| {
+            self.report_fail_open(driver, safe_client_error(error), client_error_reason(error));
+        });
+        let Ok(aggregate) = aggregate else {
+            assessor.report(CallAssessment::Unusable {
+                reason: "response_error",
+            });
+            return None;
+        };
+        let shape = ReplyShape::of(&aggregate);
+        match self.judge.parse(&aggregate) {
+            Ok(verdict) => {
+                tracing::info!(
+                    target: "libsy",
+                    judge_model,
+                    requested_max_output_tokens,
+                    stop_reason = shape.stop_reason,
+                    output_limit_reached = shape.output_limit_reached,
+                    input_tokens = shape.input_tokens,
+                    output_tokens = shape.output_tokens,
+                    reasoning_tokens = shape.reasoning_tokens,
+                    visible_chars = shape.visible_chars,
+                    reasoning_chars = shape.reasoning_chars,
+                    fenced = shape.fenced,
+                    "llm judge reply parsed"
+                );
+                Some((verdict, assessor))
+            }
+            Err(_) => {
+                let diagnosis =
+                    diagnose_parse(&completion_text(&aggregate), self.judge.response_schema());
+                tracing::warn!(
+                    target: "libsy",
+                    judge_model,
+                    reason = "parse_error",
+                    reason_code = diagnosis.reason_code,
+                    json_category = diagnosis.json_category,
+                    json_line = diagnosis.json_line,
+                    json_column = diagnosis.json_column,
+                    top_level_keys = diagnosis.top_level_keys,
+                    missing_fields = %diagnosis.missing_fields,
+                    wrong_type_fields = %diagnosis.wrong_type_fields,
+                    unknown_key_count = diagnosis.unknown_key_count,
+                    requested_max_output_tokens,
+                    stop_reason = shape.stop_reason,
+                    output_limit_reached = shape.output_limit_reached,
+                    input_tokens = shape.input_tokens,
+                    output_tokens = shape.output_tokens,
+                    reasoning_tokens = shape.reasoning_tokens,
+                    visible_chars = shape.visible_chars,
+                    reasoning_chars = shape.reasoning_chars,
+                    fenced = shape.fenced,
+                    "judge verdict unavailable; routing without one"
+                );
+                self.record_fail_open(driver, judge_model, "parse_error");
+                assessor.report(CallAssessment::Unusable {
+                    reason: diagnosis.reason_code,
+                });
+                None
+            }
+        }
     }
-}
-
-/// Logs and counts a judge failure with a bounded label that excludes message content.
-/// `error` must already be redacted: `LlmClientError::UpstreamHttp`'s `Display` interpolates the
-/// raw upstream body, which can quote the conversation back. Callers pass a
-/// `robustness::safe_*` summary rather than the error itself.
-fn report_fail_open(judge_model: &str, error: String, reason: &'static str) {
-    tracing::warn!(
-        target: "libsy",
-        judge_model,
-        reason,
-        error = %error,
-        "judge verdict unavailable; routing without one"
-    );
-    crate::observability::record_classifier_fail_open(judge_model, reason);
 }
 
 /// Returns a bounded reason for a judge call that failed at the libsy layer.
@@ -354,8 +415,19 @@ where
                 message: "no models available for category Judge".to_string(),
             });
         }
-        let verdict = self.verdict(state, request, driver, judge_models).await;
+        let (verdict, assessor) = self
+            .verdict(state, request, driver, judge_models)
+            .await
+            .unzip();
         let classification = self.policy.to_classification(verdict.as_ref(), driver)?;
+        if let Some(assessor) = assessor {
+            assessor.report(match &classification {
+                Classification::Scores(scores) if !scores.is_empty() => CallAssessment::Usable,
+                _ => CallAssessment::Unusable {
+                    reason: "verdict_rejected",
+                },
+            });
+        }
         if let Some(evidence) = self
             .evidence
             .and_then(|evidence| evidence(&self.policy, verdict.as_ref()))
@@ -383,7 +455,7 @@ fn parse_json_verdict<T: DeserializeOwned>(response: &AggLlmResponse) -> Result<
     })
 }
 
-fn strip_json_fence(text: &str) -> &str {
+pub(super) fn strip_json_fence(text: &str) -> &str {
     let Some(rest) = text.strip_prefix("```") else {
         return text;
     };
@@ -403,7 +475,7 @@ mod tests {
     use serde::Deserialize;
     use switchyard_protocol::{ContentBlock, LlmClientError, text_request, text_response};
 
-    use crate::core::algorithm::Step;
+    use crate::core::algorithm::{AssessmentState, Step};
     use crate::core::classifier::Score;
     use switchyard_protocol::{LlmResponse, LlmResponseChunk, Response};
 
@@ -429,7 +501,7 @@ mod tests {
         }
     }
 
-    /// Reports only whether a verdict arrived.
+    /// Reports only whether a verdict arrived, and abstains on a verdict of `false`.
     struct TestPolicy;
 
     impl JudgePolicy for TestPolicy {
@@ -440,10 +512,10 @@ mod tests {
             verdict: Option<&Self::Verdict>,
             _driver: &Driver,
         ) -> Result<Classification> {
-            let target = if verdict.is_some() {
-                "verdict"
-            } else {
-                "no-verdict"
+            let target = match verdict {
+                Some(verdict) if !verdict.ok => return Ok(Classification::Ambiguous(vec![])),
+                Some(_) => "verdict",
+                None => "no-verdict",
             };
             Ok(Classification::Scores(vec![Score {
                 target: ModelId::from(target),
@@ -458,8 +530,10 @@ mod tests {
     }
 
     fn request() -> Request {
+        let mut llm_request = text_request(Some("auto".to_string()), "judge this");
+        llm_request.output.max_output_tokens = Some(128);
         Request {
-            llm_request: text_request(Some("auto".to_string()), "judge this"),
+            llm_request,
             raw_request: None,
             metadata: None,
         }
@@ -573,22 +647,50 @@ mod tests {
 
     /// Serves the single offloaded judge call with `reply` through a standalone step receiver.
     async fn score_served_with(reply: Result<Response>) -> Result<ModelId> {
+        score_with(&classifier(), reply).await
+    }
+
+    async fn score_with<J>(
+        classifier: &JudgeClassifier<J, TestPolicy>,
+        reply: Result<Response>,
+    ) -> Result<ModelId>
+    where
+        J: Judge<Verdict = TestVerdict>,
+    {
+        let (classification, _) = score_and_assess(classifier, reply).await?;
+        selected(classification)
+    }
+
+    /// Serves the judge call like [`score_with`] and returns what the judge reported about
+    /// the reply once scoring finished.
+    async fn score_and_assess<J>(
+        classifier: &JudgeClassifier<J, TestPolicy>,
+        reply: Result<Response>,
+    ) -> Result<(Classification, Option<AssessmentState>)>
+    where
+        J: Judge<Verdict = TestVerdict>,
+    {
         let models = RuntimeModels::new([(Category::Judge, vec![ModelId::from("judge")])].into());
         let (driver, step_rx) = Driver::new("test", Arc::new(models));
         let mut steps = tokio_stream::wrappers::ReceiverStream::new(step_rx);
-        let classifier = classifier();
         let mut state = State::default();
         let mut request = request();
 
         let serve = async {
-            if let Some(Ok(Step::CallModel(call))) = steps.next().await {
-                let _ = call.respond(reply);
-            }
+            let Some(Ok(Step::CallModel(mut call))) = steps.next().await else {
+                return None;
+            };
+            let assessment = call.take_assessment();
+            let _ = call.respond(reply);
+            assessment
         };
-        let (classification, ()) =
+        let (classification, assessment) =
             tokio::join!(classifier.score(&mut state, &mut request, &driver), serve);
         let (classification, _) = classification?;
-        selected(classification)
+        Ok((
+            classification,
+            assessment.map(|mut assessment| assessment.try_take()),
+        ))
     }
 
     #[tokio::test]
@@ -716,5 +818,230 @@ mod tests {
             assert!(judge.parse(&text_response(None, reply))?.ok);
         }
         Ok(())
+    }
+
+    /// A judge reply cut off at its output cap: hidden reasoning, then the start of a verdict.
+    fn truncated_at_cap(reasoning: &str, visible: &str) -> Response {
+        let mut response = text_response(None, visible);
+        response.usage.input_tokens = Some(959);
+        response.usage.output_tokens = Some(128);
+        let output = &mut response.outputs[0];
+        output.stop_reason = Some(switchyard_protocol::StopReason::MaxTokens);
+        output.content.insert(
+            0,
+            ContentBlock::Reasoning {
+                text: reasoning.to_string(),
+                signature: None,
+                details: Vec::new(),
+                openai_chat_field: Default::default(),
+            },
+        );
+        Response {
+            llm_response: LlmResponse::Agg(response),
+            metadata: None,
+            upstream_headers: http::HeaderMap::new(),
+        }
+    }
+
+    async fn logs_for<J>(
+        classifier: &JudgeClassifier<J, TestPolicy>,
+        reply: impl Fn() -> Response,
+    ) -> (ModelId, String)
+    where
+        J: Judge<Verdict = TestVerdict>,
+    {
+        let capture = super::super::judge_diagnostics::LogCapture::default();
+        let selected = {
+            let _guard = capture.install();
+            let _ = score_with(classifier, Ok(reply())).await;
+            capture.rearm();
+            score_with(classifier, Ok(reply())).await
+        };
+        (selected.expect("policy selection"), capture.text())
+    }
+
+    #[tokio::test]
+    async fn a_reply_truncated_at_the_output_cap_is_logged_without_its_content() {
+        let (selected, logs) = logs_for(&classifier(), || {
+            truncated_at_cap("PRIVATE-REASONING", r#"{"ok": "SECRET-ECHO"#)
+        })
+        .await;
+
+        assert_eq!(selected, "no-verdict");
+        assert!(logs.contains("WARN"), "{logs}");
+        for field in [
+            "judge verdict unavailable; routing without one",
+            "judge_model=\"judge\"",
+            "reason=\"parse_error\"",
+            "reason_code=\"truncated_json\"",
+            "json_category=\"eof\"",
+            "json_line=1",
+            "requested_max_output_tokens=128",
+            "stop_reason=\"max_tokens\"",
+            "output_limit_reached=true",
+            "input_tokens=959",
+            "output_tokens=128",
+            "visible_chars=19",
+            "reasoning_chars=17",
+        ] {
+            assert!(logs.contains(field), "missing {field} in {logs}");
+        }
+        assert!(!logs.contains("SECRET-ECHO"), "{logs}");
+        assert!(!logs.contains("PRIVATE-REASONING"), "{logs}");
+        assert!(!logs.contains("llm judge reply parsed"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn a_reply_spent_entirely_on_reasoning_is_an_empty_completion() {
+        let (selected, logs) =
+            logs_for(&classifier(), || truncated_at_cap("PRIVATE-REASONING", "")).await;
+
+        assert_eq!(selected, "no-verdict");
+        assert!(logs.contains("reason_code=\"empty_completion\""), "{logs}");
+        assert!(logs.contains("visible_chars=0"), "{logs}");
+        assert!(logs.contains("output_limit_reached=true"), "{logs}");
+        assert!(!logs.contains("PRIVATE-REASONING"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn a_parsed_verdict_is_logged_with_its_shape() {
+        let (selected, logs) = logs_for(&classifier(), || buffered(VERDICT)).await;
+
+        assert_eq!(selected, "verdict");
+        assert!(logs.contains("INFO"), "{logs}");
+        assert!(logs.contains("llm judge reply parsed"), "{logs}");
+        assert!(logs.contains("requested_max_output_tokens=128"), "{logs}");
+        assert!(logs.contains("output_limit_reached=false"), "{logs}");
+        assert!(logs.contains("visible_chars=11"), "{logs}");
+        assert!(!logs.contains("judge verdict unavailable"), "{logs}");
+        assert!(!logs.contains("\"ok\""), "{logs}");
+    }
+
+    struct PassThroughInput;
+
+    impl ClassifierInput for PassThroughInput {
+        fn build_messages(&self, _state: &State, request: &Request) -> Vec<Message> {
+            request.llm_request.messages.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn schema_mismatches_name_schema_fields_but_never_invented_keys() -> Result<()> {
+        use super::super::classifier_contract::ClassifierContractConfig;
+
+        let contract = ClassifierContract::from_config(
+            &ClassifierContractConfig::default(),
+            "Return one JSON verdict.",
+            r#"{
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "TestVerdict",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "properties": {"ok": {"type": "boolean"}, "note": {"type": "string"}},
+                        "required": ["ok", "note"],
+                        "additionalProperties": false
+                    }
+                }
+            }"#,
+        )?;
+        let judge = StructuredJudge::new(
+            PassThroughInput,
+            contract,
+            SerdeDecoder::<TestVerdict>::new(),
+            JudgeRuntimeConfig::new(256)?,
+        );
+        let (selected, logs) = logs_for(&JudgeClassifier::new(judge, TestPolicy), || {
+            buffered(r#"{"ok":"SECRET-VALUE","INVENTED-KEY":1}"#)
+        })
+        .await;
+
+        assert_eq!(selected, "no-verdict");
+        for field in [
+            "reason_code=\"schema_mismatch\"",
+            "missing_fields=note",
+            "wrong_type_fields=ok",
+            "unknown_key_count=1",
+            "top_level_keys=2",
+            "requested_max_output_tokens=256",
+            "stop_reason=\"unreported\"",
+        ] {
+            assert!(logs.contains(field), "missing {field} in {logs}");
+        }
+        assert!(!logs.contains("SECRET-VALUE"), "{logs}");
+        assert!(!logs.contains("INVENTED-KEY"), "{logs}");
+        Ok(())
+    }
+
+    async fn assessment_of(reply: Result<Response>) -> Option<AssessmentState> {
+        score_and_assess(&classifier(), reply)
+            .await
+            .expect("scoring")
+            .1
+    }
+
+    fn unusable(reason: &'static str) -> Option<AssessmentState> {
+        Some(AssessmentState::Reported(CallAssessment::Unusable {
+            reason,
+        }))
+    }
+
+    #[tokio::test]
+    async fn a_verdict_the_policy_acts_on_is_reported_usable() {
+        assert_eq!(
+            assessment_of(Ok(buffered(VERDICT))).await,
+            Some(AssessmentState::Reported(CallAssessment::Usable))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unusable_reply_is_reported_with_its_parse_reason() {
+        assert_eq!(
+            assessment_of(Ok(truncated_at_cap("thinking", r#"{"ok": tr"#))).await,
+            unusable("truncated_json")
+        );
+        assert_eq!(
+            assessment_of(Ok(truncated_at_cap("thinking", ""))).await,
+            unusable("empty_completion")
+        );
+        assert_eq!(
+            assessment_of(Ok(buffered("sorry, I can't help with that"))).await,
+            unusable("invalid_json")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_parsed_verdict_the_policy_cannot_act_on_is_rejected() {
+        assert_eq!(
+            assessment_of(Ok(buffered(r#"{"ok":false}"#))).await,
+            unusable("verdict_rejected")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_breaks_mid_stream_is_a_response_error() {
+        let partial = LlmResponseChunk::TextDelta {
+            index: 0,
+            text: "{\"ok\":".to_string(),
+        };
+        assert_eq!(
+            assessment_of(Ok(streamed_then_failing(partial))).await,
+            unusable("response_error")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_call_leaves_nothing_to_assess() {
+        let error = LibsyError::client_call(
+            "judge",
+            LlmClientError::Timeout {
+                source: Box::new(std::io::Error::other("judge unreachable")),
+            },
+        );
+        assert_eq!(
+            assessment_of(Err(error)).await,
+            Some(AssessmentState::NotReported)
+        );
     }
 }
