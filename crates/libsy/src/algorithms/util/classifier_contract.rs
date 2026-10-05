@@ -63,6 +63,7 @@ impl ClassifierContractConfig {
 pub(crate) struct ClassifierContract {
     system_prompt: String,
     response_format: Value,
+    schema: Value,
     validator: Option<Validator>,
 }
 
@@ -91,7 +92,8 @@ impl ClassifierContract {
             })?;
         match config.response_format_type() {
             ClassifierResponseFormat::JsonSchema => {
-                Self::from_response_format(prompt_template, response_format, None)
+                let schema = schema.clone();
+                Self::from_response_format(prompt_template, response_format, schema, None)
             }
             ClassifierResponseFormat::JsonObject => {
                 validate_prompt(prompt_template)?;
@@ -105,6 +107,7 @@ impl ClassifierContract {
                 Self::from_response_format(
                     &system_prompt,
                     json!({"type": "json_object"}),
+                    schema.clone(),
                     Some(validator),
                 )
             }
@@ -128,9 +131,10 @@ impl ClassifierContract {
                 "json_schema": {
                     "name": "switchyard_classifier_response",
                     "strict": true,
-                    "schema": schema,
+                    "schema": schema.clone(),
                 }
             }),
+            schema,
             Some(validator),
         )
     }
@@ -138,6 +142,7 @@ impl ClassifierContract {
     fn from_response_format(
         prompt_template: &str,
         response_format: Value,
+        schema: Value,
         validator: Option<Validator>,
     ) -> Result<Self> {
         validate_prompt(prompt_template)?;
@@ -145,6 +150,7 @@ impl ClassifierContract {
         Ok(Self {
             system_prompt: prompt_template.to_string(),
             response_format,
+            schema,
             validator,
         })
     }
@@ -155,6 +161,11 @@ impl ClassifierContract {
 
     pub(crate) fn response_format(&self) -> &Value {
         &self.response_format
+    }
+
+    /// The inner JSON Schema a verdict must match, whichever response format carries it.
+    pub(crate) fn schema(&self) -> &Value {
+        &self.schema
     }
 
     /// Whether the provider response must be checked against the compiled schema locally.

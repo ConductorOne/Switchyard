@@ -60,16 +60,38 @@ impl TaskClassifierVerdict {
     fn is_valid(&self) -> bool {
         (0.0..=1.0).contains(&self.p_solve)
             && !self.crux.trim().is_empty()
-            && matches!(
-                (
-                    self.primary_rule.as_str(),
-                    self.capability_boundary.as_str()
-                ),
-                ("SUP-1" | "SUP-2" | "SUP-3" | "SUP-4" | "SUP-5", "supported")
-                    | ("UNC-1" | "UNC-2", "uncertain")
-                    | ("LIM-1" | "LIM-2", "unsupported")
-                    | ("none", "unmatched")
-            )
+            && Self::rule_matches_boundary(&self.primary_rule, &self.capability_boundary)
+    }
+
+    /// Logs which checks a well-formed but unusable verdict failed. The rule and boundary
+    /// are model-written strings, so only flags are logged.
+    fn report_rejected(&self, driver: &Driver) {
+        tracing::warn!(
+            target: "libsy",
+            judge_model = driver
+                .first_model_for(&Category::Judge)
+                .map(|model| model.as_str())
+                .unwrap_or("missing"),
+            reason = "invalid_verdict",
+            p_solve_in_range = (0.0..=1.0).contains(&self.p_solve),
+            crux_present = !self.crux.trim().is_empty(),
+            boundary_known = self.boundary_steps().is_some(),
+            rule_matches_boundary = Self::rule_matches_boundary(
+                &self.primary_rule,
+                &self.capability_boundary
+            ),
+            "judge verdict unavailable; routing without one"
+        );
+    }
+
+    fn rule_matches_boundary(rule: &str, boundary: &str) -> bool {
+        matches!(
+            (rule, boundary),
+            ("SUP-1" | "SUP-2" | "SUP-3" | "SUP-4" | "SUP-5", "supported")
+                | ("UNC-1" | "UNC-2", "uncertain")
+                | ("LIM-1" | "LIM-2", "unsupported")
+                | ("none", "unmatched")
+        )
     }
 
     /// Returns the number of threshold steps assigned to this capability boundary.
@@ -246,9 +268,13 @@ impl JudgePolicy for TaskClassifierPolicy {
     ) -> Result<Classification> {
         // Judge output is untrusted. An absent, invalid, or inconsistent verdict is
         // ambiguous so the surrounding router applies its configured fallback.
-        let Some(verdict) = verdict.filter(|verdict| verdict.is_valid()) else {
+        let Some(verdict) = verdict else {
             return Ok(Classification::Ambiguous(vec![]));
         };
+        if !verdict.is_valid() {
+            verdict.report_rejected(driver);
+            return Ok(Classification::Ambiguous(vec![]));
+        }
         // A usable verdict below the capability threshold is still a decision: the judge
         // does not trust the efficient tier with this task.
         let Some(threshold) = self.threshold(verdict) else {
@@ -847,6 +873,42 @@ mod tests {
             .ok_or_else(|| LibsyError::AlgorithmError {
                 message: "policy abstained".to_string(),
             })
+    }
+
+    #[test]
+    fn an_inconsistent_verdict_is_logged_as_flags_only() {
+        let capture = super::super::util::judge_diagnostics::LogCapture::default();
+        let classify = || {
+            policy()
+                .to_classification(
+                    Some(&verdict(1.5, "unsupported", "SUP-1")),
+                    &policy_driver(),
+                )
+                .expect("classification")
+        };
+        let selection = {
+            let _guard = capture.install();
+            classify();
+            capture.rearm();
+            classify()
+        };
+        let logs = capture.text();
+
+        assert!(matches!(selection, Classification::Ambiguous(_)));
+        for field in [
+            "judge verdict unavailable; routing without one",
+            "judge_model=\"judge\"",
+            "reason=\"invalid_verdict\"",
+            "p_solve_in_range=false",
+            "crux_present=true",
+            "boundary_known=true",
+            "rule_matches_boundary=false",
+        ] {
+            assert!(logs.contains(field), "missing {field} in {logs}");
+        }
+        assert!(!logs.contains("SUP-1"), "{logs}");
+        assert!(!logs.contains("test crux"), "{logs}");
+        assert!(!logs.contains("1.5"), "{logs}");
     }
 
     /// Records what each target received; answers the judge with a supported verdict and
