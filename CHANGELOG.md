@@ -18,6 +18,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Google-compatible Chat tool signatures now survive normalized request/response
+  reconstruction, SSE accumulation, and synthetic streaming on the correct call.
+  Repeated complete stream signatures are idempotent; conflicting values fail.
+  Hosts must clear this Google-only state before selecting a different provider.
 - Fork commit-message CI lints new fork-authored commits while excluding commits
   present in NVIDIA-NeMo/Switchyard `main`; upstream imports no longer fail the
   fork gate on historical upstream messages.

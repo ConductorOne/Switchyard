@@ -255,6 +255,7 @@ impl AggLlmResponse {
                             id: Some(call.id.clone()),
                             name: Some(call.name.clone()),
                             arguments_delta: serde_json::to_string(&call.arguments).ok(),
+                            google_thought_signature: call.google_thought_signature.clone(),
                         });
                         chunks.push(LlmResponseChunk::ToolCallDone {
                             index: tool_call_index,
@@ -407,6 +408,9 @@ pub enum LlmResponseChunk {
         name: Option<String>,
         /// Fragment of the serialized tool arguments.
         arguments_delta: Option<String>,
+        /// Complete opaque Google Chat signature, never an appendable fragment.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        google_thought_signature: Option<String>,
     },
     /// Finalizes a JSON-schema function tool call.
     ToolCallDone {
@@ -599,6 +603,7 @@ struct PartialToolCall {
     id: Option<String>,
     name: Option<String>,
     arguments: String,
+    google_thought_signature: Option<String>,
 }
 
 /// A custom tool call being assembled from streamed input deltas.
@@ -667,6 +672,7 @@ impl ResponseAccumulator {
                 id,
                 name,
                 arguments_delta,
+                google_thought_signature,
             } => {
                 let call = self.tool_calls.entry(index).or_default();
                 if id.is_some() {
@@ -677,6 +683,9 @@ impl ResponseAccumulator {
                 }
                 if let Some(delta) = arguments_delta {
                     call.arguments.push_str(&delta);
+                }
+                if google_thought_signature.is_some() {
+                    call.google_thought_signature = google_thought_signature;
                 }
             }
             LlmResponseChunk::ToolCallDone { index, call } => {
@@ -768,6 +777,7 @@ impl ResponseAccumulator {
                 id: call.id.unwrap_or_default(),
                 name: call.name.unwrap_or_default(),
                 arguments: parse_tool_arguments(&call.arguments),
+                google_thought_signature: call.google_thought_signature,
             }));
         }
         for call in self.custom_tool_calls.into_values() {
@@ -950,12 +960,14 @@ mod tests {
                 id: Some("call_1".to_string()),
                 name: Some("lookup".to_string()),
                 arguments_delta: Some("{\"q\":".to_string()),
+                google_thought_signature: None,
             },
             LlmResponseChunk::ToolCallDelta {
                 index: 0,
                 id: None,
                 name: None,
                 arguments_delta: Some("\"rust\"}".to_string()),
+                google_thought_signature: None,
             },
             LlmResponseChunk::MessageStop {
                 reason: Some("tool_calls".to_string()),
@@ -968,6 +980,7 @@ mod tests {
                 id: "call_1".to_string(),
                 name: "lookup".to_string(),
                 arguments: json!({"q": "rust"}),
+                google_thought_signature: None,
             })]
         );
     }

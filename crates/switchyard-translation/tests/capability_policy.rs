@@ -36,6 +36,7 @@ fn request_for(case: CapabilityCase) -> LlmRequest {
             id: "call_1".to_string(),
             name: "lookup".to_string(),
             arguments: json!({}),
+            google_thought_signature: None,
         })),
         CapabilityCase::Images => Some(ContentBlock::Image {
             source: ImageSource::Url {
