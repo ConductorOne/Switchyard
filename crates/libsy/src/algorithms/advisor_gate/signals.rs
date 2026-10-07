@@ -99,6 +99,7 @@ mod tests {
                         id: "t1".to_string(),
                         name: "bash".to_string(),
                         arguments: serde_json::json!({}),
+                        google_thought_signature: None,
                     }),
                 ],
                 stop_reason: None,

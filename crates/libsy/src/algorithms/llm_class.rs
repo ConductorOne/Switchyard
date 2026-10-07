@@ -1505,6 +1505,7 @@ mod tests {
                 id: id.to_string(),
                 name: "search".to_string(),
                 arguments: Value::Null,
+                google_thought_signature: None,
             })],
         }
     }

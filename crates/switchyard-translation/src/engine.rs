@@ -300,9 +300,10 @@ impl TranslationEngine {
 
     /// Encodes one neutral or preserved stream event for a target provider.
     ///
-    /// A preserved event replays its retained JSON value unchanged when its
-    /// source and target formats match. Cross-format encoding intentionally
-    /// uses only its normalized events.
+    /// A preserved event replays its retained JSON value when source and target
+    /// formats match, except invalid data and Google tool updates that need
+    /// snapshot deduplication or an SDK-compatible empty function object.
+    /// Cross-format encoding uses only its normalized events.
     pub fn encode_stream_event(
         &self,
         state: &mut StreamTranslationState,

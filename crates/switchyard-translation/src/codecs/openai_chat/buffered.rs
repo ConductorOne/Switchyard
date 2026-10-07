@@ -5,6 +5,8 @@
 
 use serde_json::{Map, Value, json};
 
+use super::{decode_google_thought_signature, encode_google_thought_signature};
+
 use crate::codecs::common::{
     first_nonempty_string, is_known_role_name, provider_extensions, reasoning_text_from_blocks,
     reasoning_text_from_details, text_from_blocks,
@@ -375,14 +377,7 @@ impl FormatCodec for OpenAiChatCodec {
                     .content
                     .iter()
                     .filter_map(|block| match block {
-                        ContentBlock::ToolCall(call) => Some(json!({
-                            "id": call.id,
-                            "type": "function",
-                            "function": {
-                                "name": call.name,
-                                "arguments": json_string(&call.arguments),
-                            },
-                        })),
+                        ContentBlock::ToolCall(call) => Some(encode_openai_tool_call(call)),
                         _ => None,
                     })
                     .collect::<Vec<_>>()
@@ -751,7 +746,22 @@ pub(crate) fn decode_openai_tool_call(
         id,
         name,
         arguments,
+        google_thought_signature: decode_google_thought_signature(tool_call)?
+            .map(ToOwned::to_owned),
     }))
+}
+
+fn encode_openai_tool_call(call: &ToolCall) -> Value {
+    let mut tool_call = json!({
+        "id": call.id,
+        "type": "function",
+        "function": {
+            "name": call.name,
+            "arguments": json_string(&call.arguments),
+        },
+    });
+    encode_google_thought_signature(&mut tool_call, call.google_thought_signature.as_deref());
+    tool_call
 }
 
 /// Parses stringified tool-call arguments when possible.
@@ -930,14 +940,7 @@ fn encode_message_without_tool_results_to_openai(
         .content
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::ToolCall(call) => Some(json!({
-                "id": call.id,
-                "type": "function",
-                "function": {
-                    "name": call.name,
-                    "arguments": json_string(&call.arguments),
-                },
-            })),
+            ContentBlock::ToolCall(call) => Some(encode_openai_tool_call(call)),
             _ => None,
         })
         .collect::<Vec<_>>();

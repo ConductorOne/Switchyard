@@ -668,6 +668,7 @@ fn decode_anthropic_content_block(
                 .unwrap_or_default()
                 .to_string(),
             arguments: block.get("input").cloned().unwrap_or_else(|| json!({})),
+            google_thought_signature: None,
         })],
         Some("tool_result") => vec![ContentBlock::ToolResult(ToolResult {
             tool_call_id: block

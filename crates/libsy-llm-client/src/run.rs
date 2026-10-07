@@ -1555,6 +1555,7 @@ mod tests {
                 id: Some("toolu_stream".to_string()),
                 name: Some("lookup".to_string()),
                 arguments_delta: Some("{}".to_string()),
+                google_thought_signature: None,
             },
             LlmResponseChunk::MessageStop {
                 reason: Some("tool_use".to_string()),

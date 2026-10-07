@@ -243,6 +243,7 @@ mod tests {
                 id: "call-1".to_string(),
                 name: name.to_string(),
                 arguments,
+                google_thought_signature: None,
             })],
         }
     }
@@ -311,6 +312,7 @@ mod tests {
                         id: "call-1".to_string(),
                         name: "apply_patch".to_string(),
                         arguments: json!({"patch": "*** Begin Patch"}),
+                        google_thought_signature: None,
                     }),
                 ],
             }],

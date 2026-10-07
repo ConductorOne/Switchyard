@@ -89,6 +89,7 @@ fn tool_call_turn() -> Response {
                     id: "t1".to_string(),
                     name: "bash".to_string(),
                     arguments: serde_json::json!({}),
+                    google_thought_signature: None,
                 })],
                 url_citations: Vec::new(),
                 stop_reason: None,
@@ -784,6 +785,7 @@ async fn streamed_tool_call_turn_replays_without_review() {
             id: Some("t1".to_string()),
             name: Some("bash".to_string()),
             arguments_delta: Some("{}".to_string()),
+            google_thought_signature: None,
         },
     ])];
     let serve = script.serve("APPROVE", {
@@ -840,6 +842,7 @@ async fn pattern_trigger_matches_on_tool_call_turns() {
                         id: "t1".to_string(),
                         name: "bash".to_string(),
                         arguments: serde_json::json!({}),
+                        google_thought_signature: None,
                     }),
                 ],
                 url_citations: Vec::new(),

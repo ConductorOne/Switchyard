@@ -100,6 +100,7 @@ pub(crate) fn turn_request(failed: bool) -> Request {
                         id: "call_1".to_string(),
                         name: "Bash".to_string(),
                         arguments: json!({"command": "cargo test"}),
+                        google_thought_signature: None,
                     })],
                 },
                 Message {
