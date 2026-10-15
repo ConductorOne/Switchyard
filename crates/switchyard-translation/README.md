@@ -26,7 +26,10 @@ event. It also removes repeated complete call ids on the first signature update
 and on later updates to that signed call, even without a signature. Metadata-only
 calls get an empty `function` object so OpenAI SDK stream accumulation accepts
 them. Other raw fields and argument fragments remain unchanged. Signed streams
-require explicit tool indices and one Chat choice. Multiple choices fail even
+require an identified call and one Chat choice. Google's Chat endpoint omits
+tool indices and sends each call whole, so a call without an index is keyed by
+its id. Once calls are keyed by id, a fragment with neither index nor id, or a
+second named call with a known id, fails. Multiple choices fail even
 with omitted or duplicate indices, before, alongside, or after a signature.
 Unsigned Chat streams keep their existing behavior.
 Distinct complete call ids at one index also make a later signature ambiguous

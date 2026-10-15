@@ -921,3 +921,186 @@ fn google_signature_can_precede_first_call_id_and_stable_id_updates() -> TestRes
     }
     Ok(())
 }
+
+/// Google's Chat endpoint streams each call whole, without `index`, ends with
+/// `finish_reason: "stop"`, and repeats `usage` on every chunk.
+fn google_unindexed_stream_frames() -> Vec<Value> {
+    let usage = json!({"completion_tokens": 18, "prompt_tokens": 64, "total_tokens": 142});
+    vec![
+        json!({"id": "google-stream", "object": "chat.completion.chunk", "model": "gemini-provider",
+        "usage": usage, "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [
+            call("call_signed", Some(SIGNATURE)), call("call_unsigned", None)
+        ]}}]}),
+        // A repeated signature for a known call id stays bound to that call.
+        json!({"id": "google-stream", "object": "chat.completion.chunk", "model": "gemini-provider",
+        "usage": usage, "choices": [{"index": 0, "delta": {"tool_calls": [
+            {"id": "call_signed", "extra_content": {"google": {"thought_signature": SIGNATURE}}}
+        ]}}]}),
+        json!({"id": "google-stream", "object": "chat.completion.chunk", "model": "gemini-provider",
+            "usage": usage, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": "stop"}]}),
+    ]
+}
+
+#[test]
+fn google_unindexed_sse_calls_are_keyed_by_call_id() -> TestResult {
+    let engine = TranslationEngine::default();
+    for preserve_raw in [false, true] {
+        let mut decoder = StreamTranslationState::default();
+        let mut encoder = StreamTranslationState::default();
+        let mut output = Vec::new();
+        for frame in google_unindexed_stream_frames() {
+            let event = engine.decode_stream_event(&mut decoder, WireFormat::OpenAiChat, frame)?;
+            assert!(
+                !event
+                    .normalized()
+                    .iter()
+                    .any(|chunk| matches!(chunk, LlmResponseChunk::DecodeError { .. })),
+                "{:?}",
+                event.normalized()
+            );
+            let event = if preserve_raw {
+                event
+            } else {
+                LlmResponseStreamEvent::new(event.into_parts().1)
+            };
+            output.extend(engine.encode_stream_event(
+                &mut encoder,
+                WireFormat::OpenAiChat,
+                event,
+            )?);
+        }
+        output.extend(engine.finish_stream(&mut encoder, WireFormat::OpenAiChat)?);
+        assert!(
+            output.iter().all(|frame| frame.get("error").is_none()),
+            "{output:?}"
+        );
+        let (response, _) = normalize_and_encode(&engine, &output)?;
+        assert_normalized_calls(&response);
+        if preserve_raw {
+            // Replay keeps each id, gives metadata-only updates a `function` object, and
+            // drops the repeated signature.
+            let calls: Vec<&Value> = output
+                .iter()
+                .filter_map(|frame| frame["choices"][0]["delta"]["tool_calls"].as_array())
+                .flatten()
+                .collect();
+            assert!(
+                calls
+                    .iter()
+                    .all(|call| call["id"].is_string() && call["function"].is_object())
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| call["extra_content"]["google"]["thought_signature"].is_string())
+                    .count(),
+                1
+            );
+        } else {
+            assert_stream_signature_mapping(&output);
+        }
+    }
+    let (response, _) = normalize_and_encode(&engine, &google_unindexed_stream_frames())?;
+    assert_normalized_calls(&response);
+    Ok(())
+}
+
+#[test]
+fn google_unindexed_sse_rejects_unplaceable_or_reused_calls() -> TestResult {
+    let engine = TranslationEngine::default();
+    let first = google_unindexed_stream_frames().remove(0);
+    let delta = |calls: Value| json!({"choices": [{"index": 0, "delta": {"tool_calls": calls}}]});
+    for later in [
+        // A second whole call reusing a known id is a different call, not an update.
+        delta(json!([call("call_signed", None)])),
+        // Fragments with neither index nor id cannot be placed once calls are keyed by id.
+        delta(json!([{"function": {"arguments": "{}"}}])),
+        // An empty id is no identity.
+        delta(
+            json!([{"id": "", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}]),
+        ),
+        // An explicit index at the top of the range leaves no slot after it.
+        delta(json!([{"index": u64::MAX, "id": "call_last", "function": {"name": "lookup"}}])),
+    ] {
+        let mut decoder = StreamTranslationState::default();
+        engine.decode_stream_event(&mut decoder, WireFormat::OpenAiChat, first.clone())?;
+        let mut normalized = engine
+            .decode_stream_event(&mut decoder, WireFormat::OpenAiChat, later.clone())?
+            .into_parts()
+            .1;
+        if !normalized
+            .iter()
+            .any(|chunk| matches!(chunk, LlmResponseChunk::DecodeError { .. }))
+        {
+            // The out-of-range index itself is accepted; the next unindexed call has no slot.
+            normalized = engine
+                .decode_stream_event(
+                    &mut decoder,
+                    WireFormat::OpenAiChat,
+                    delta(json!([call("call_after", None)])),
+                )?
+                .into_parts()
+                .1;
+        }
+        assert!(
+            matches!(
+                normalized.as_slice(),
+                [LlmResponseChunk::DecodeError { .. }]
+            ),
+            "{later}: {normalized:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn chat_stop_after_tool_calls_is_a_tool_use_stop_in_other_formats() -> TestResult {
+    let engine = TranslationEngine::default();
+    // Streaming: Google ends a tool-calling turn with `finish_reason: "stop"`.
+    for (frames, expected) in [
+        (google_unindexed_stream_frames(), "tool_use"),
+        (
+            vec![
+                json!({"id": "google-text", "model": "gemini-provider", "choices": [{"index": 0,
+                    "delta": {"role": "assistant", "content": "done"}}]}),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+            ],
+            "end_turn",
+        ),
+    ] {
+        let mut decoder = StreamTranslationState::default();
+        let mut encoder =
+            StreamTranslationState::new(WireFormat::OpenAiChat, WireFormat::AnthropicMessages);
+        let mut output = Vec::new();
+        for frame in frames {
+            let event = engine.decode_stream_event(&mut decoder, WireFormat::OpenAiChat, frame)?;
+            output.extend(engine.encode_stream_event(
+                &mut encoder,
+                WireFormat::AnthropicMessages,
+                LlmResponseStreamEvent::new(event.into_parts().1),
+            )?);
+        }
+        output.extend(engine.finish_stream(&mut encoder, WireFormat::AnthropicMessages)?);
+        let stops: Vec<&Value> = output
+            .iter()
+            .filter(|event| event["type"] == "message_delta")
+            .map(|event| &event["delta"]["stop_reason"])
+            .collect();
+        assert_eq!(stops, [&json!(expected)], "{output:?}");
+    }
+    // Buffered: the same turn as one completion.
+    let mut body = response_body();
+    body["choices"][0]["finish_reason"] = json!("stop");
+    let response = engine
+        .decode_response(WireFormat::OpenAiChat, &body, &TranslationPolicy::default())?
+        .response;
+    let anthropic = engine
+        .encode_response(
+            WireFormat::AnthropicMessages,
+            &response,
+            &normalized_policy(),
+        )?
+        .body;
+    assert_eq!(anthropic["stop_reason"], "tool_use");
+    Ok(())
+}

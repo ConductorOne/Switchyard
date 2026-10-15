@@ -36,6 +36,7 @@ pub(crate) fn prepare_google_tool_replay(state: &StreamTranslationState, event: 
             let (earlier, current) = calls.split_at_mut(position);
             let (call, later) = current.split_first_mut().unwrap();
             let Some(index) = call["index"].as_u64() else {
+                prepare_unindexed_google_call(state, earlier, call);
                 continue;
             };
             let signature = call["extra_content"]["google"]["thought_signature"].as_str();
@@ -94,6 +95,63 @@ pub(crate) fn prepare_google_tool_replay(state: &StreamTranslationState, event: 
                     call.remove("extra_content");
                 }
             }
+        }
+    }
+}
+
+// Google omits `index`, so the call id is the only identity and stays on every update.
+fn prepare_unindexed_google_call(
+    state: &StreamTranslationState,
+    earlier: &[Value],
+    call: &mut Value,
+) {
+    let Some(id) = call.get("id").and_then(Value::as_str).map(str::to_owned) else {
+        return;
+    };
+    let signature = call["extra_content"]["google"]["thought_signature"]
+        .as_str()
+        .map(str::to_owned);
+    let mut seen = state
+        .tool_states
+        .values()
+        .filter(|tool| tool.id.as_deref() == Some(id.as_str()))
+        .filter_map(|tool| tool.google_thought_signature.as_deref())
+        .chain(
+            earlier
+                .iter()
+                .filter(|previous| {
+                    previous["index"].is_null()
+                        && previous.get("id").and_then(Value::as_str) == Some(id.as_str())
+                })
+                .filter_map(|previous| {
+                    previous["extra_content"]["google"]["thought_signature"].as_str()
+                }),
+        );
+    let (signed, repeated) = match signature.as_deref() {
+        Some(signature) => (true, seen.any(|previous| previous == signature)),
+        None => (seen.next().is_some(), false),
+    };
+    if !signed {
+        return;
+    }
+    let Some(call) = call.as_object_mut() else {
+        return;
+    };
+    if !call.contains_key("function") {
+        call.insert("function".to_string(), Value::Object(Map::new()));
+    }
+    if !repeated {
+        return;
+    }
+    if let Some(extra) = call.get_mut("extra_content").and_then(Value::as_object_mut) {
+        if let Some(google) = extra.get_mut("google").and_then(Value::as_object_mut) {
+            google.remove("thought_signature");
+            if google.is_empty() {
+                extra.remove("google");
+            }
+        }
+        if extra.is_empty() {
+            call.remove("extra_content");
         }
     }
 }
@@ -248,9 +306,33 @@ fn decode_openai_chat_stream(
                 for tool_call in tool_calls {
                     if let Some(tool_call) = tool_call.as_object() {
                         let function = tool_call.get("function").and_then(Value::as_object);
-                        let index =
-                            tool_call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                        let id = tool_call.get("id").and_then(Value::as_str);
+                        let id = tool_call
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty());
+                        let explicit_index = tool_call.get("index").and_then(Value::as_u64);
+                        let index = match (explicit_index, id) {
+                            (Some(index), _) => index as usize,
+                            // Google's Chat endpoint streams each call whole and omits `index`;
+                            // the call id is then the only identity, so key calls by it.
+                            (None, Some(id)) => {
+                                match unindexed_chat_tool_index(state, id, function) {
+                                    Ok(index) => index,
+                                    Err(message) => {
+                                        return vec![LlmResponseChunk::DecodeError {
+                                            message: message.to_string(),
+                                        }];
+                                    }
+                                }
+                            }
+                            // Once calls are keyed by id, a fragment with neither cannot be placed.
+                            (None, None) if state.chat_unindexed_tool_calls => {
+                                return vec![LlmResponseChunk::DecodeError {
+                                    message: "Chat tool call has no index or id".to_string(),
+                                }];
+                            }
+                            (None, None) => 0,
+                        };
                         let tool = state.tool_states.entry(index).or_default();
                         if let Some(id) = id {
                             tool.decoded_chat_tool_id_ambiguous |= tool
@@ -279,12 +361,12 @@ fn decode_openai_chat_stream(
                             tool_call,
                         ) {
                             Ok(Some(signature)) => {
-                                if tool_call.get("index").and_then(Value::as_u64).is_none()
+                                if (explicit_index.is_none() && id.is_none())
                                     || state.chat_other_choice_seen
                                     || choice.get("index").and_then(Value::as_u64).unwrap_or(0) != 0
                                 {
                                     return vec![LlmResponseChunk::DecodeError {
-                                            message: "Google tool signature requires an indexed call in one Chat choice".to_string(),
+                                            message: "Google tool signature requires an identified call in one Chat choice".to_string(),
                                         }];
                                 }
                                 let tool = state.tool_states.entry(index).or_default();
@@ -325,6 +407,7 @@ fn decode_openai_chat_stream(
                             .and_then(|function| function.get("arguments"))
                             .and_then(Value::as_str)
                             .map(ToOwned::to_owned);
+                        state.chat_tool_call_decoded = true;
                         out.push(LlmResponseChunk::ToolCallDelta {
                             index,
                             id: tool_call
@@ -351,11 +434,53 @@ fn decode_openai_chat_stream(
                 });
             }
             out.push(LlmResponseChunk::MessageStop {
-                reason: Some(reason.to_string()),
+                reason: Some(chat_finish_reason(reason, state.chat_tool_call_decoded).to_string()),
             });
         }
     }
     out
+}
+
+/// Some Chat providers (Google among them) end a turn that called tools with `stop`.
+/// Report it as a tool-call stop so other formats ask the client to run the tools.
+pub(crate) fn chat_finish_reason(reason: &str, called_tools: bool) -> &str {
+    if called_tools && reason == "stop" {
+        "tool_calls"
+    } else {
+        reason
+    }
+}
+
+/// Index for a Chat tool call that carries an `id` but no `index`: the earlier call with
+/// that id, else the slot after every call seen so far. Unindexed calls arrive whole, so a
+/// second named call with a known id is a different call that reused the id.
+fn unindexed_chat_tool_index(
+    state: &mut StreamTranslationState,
+    id: &str,
+    function: Option<&Map<String, Value>>,
+) -> Result<usize, &'static str> {
+    state.chat_unindexed_tool_calls = true;
+    let known = state
+        .tool_states
+        .iter()
+        .find(|(_, tool)| tool.decoded_chat_tool_id.as_deref() == Some(id))
+        .map(|(index, _)| *index);
+    if let Some(index) = known {
+        let named = function
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+            .is_some_and(|name| !name.is_empty());
+        if named && state.pending_chat_tool_names.contains_key(&index) {
+            return Err("Chat tool call id is repeated");
+        }
+        return Ok(index);
+    }
+    match state.tool_states.keys().next_back() {
+        Some(last) => last
+            .checked_add(1)
+            .ok_or("Chat tool call index is out of range"),
+        None => Ok(0),
+    }
 }
 
 // Encodes neutral streaming events into OpenAI Chat chunks.

@@ -58,6 +58,12 @@ pub struct StreamTranslationState {
     /// Multiple Chat choices make later Google call identity ambiguous, even without indexes.
     #[serde(default)]
     pub(crate) chat_other_choice_seen: bool,
+    /// Chat tool calls were keyed by `id` because the provider omitted `index`.
+    #[serde(default)]
+    pub(crate) chat_unindexed_tool_calls: bool,
+    /// The Chat decoder has seen a tool call in this stream.
+    #[serde(default)]
+    pub(crate) chat_tool_call_decoded: bool,
     #[serde(default)]
     pub(crate) active_anthropic_tool: Option<usize>,
     #[serde(default)]
