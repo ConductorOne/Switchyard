@@ -984,3 +984,51 @@ fn google_unindexed_sse_calls_are_keyed_by_call_id() -> TestResult {
     assert_normalized_calls(&response);
     Ok(())
 }
+
+#[test]
+fn google_unindexed_sse_rejects_unplaceable_or_reused_calls() -> TestResult {
+    let engine = TranslationEngine::default();
+    let first = google_unindexed_stream_frames().remove(0);
+    let delta = |calls: Value| json!({"choices": [{"index": 0, "delta": {"tool_calls": calls}}]});
+    for later in [
+        // A second whole call reusing a known id is a different call, not an update.
+        delta(json!([call("call_signed", None)])),
+        // Fragments with neither index nor id cannot be placed once calls are keyed by id.
+        delta(json!([{"function": {"arguments": "{}"}}])),
+        // An empty id is no identity.
+        delta(
+            json!([{"id": "", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}]),
+        ),
+        // An explicit index at the top of the range leaves no slot after it.
+        delta(json!([{"index": u64::MAX, "id": "call_last", "function": {"name": "lookup"}}])),
+    ] {
+        let mut decoder = StreamTranslationState::default();
+        engine.decode_stream_event(&mut decoder, WireFormat::OpenAiChat, first.clone())?;
+        let mut normalized = engine
+            .decode_stream_event(&mut decoder, WireFormat::OpenAiChat, later.clone())?
+            .into_parts()
+            .1;
+        if !normalized
+            .iter()
+            .any(|chunk| matches!(chunk, LlmResponseChunk::DecodeError { .. }))
+        {
+            // The out-of-range index itself is accepted; the next unindexed call has no slot.
+            normalized = engine
+                .decode_stream_event(
+                    &mut decoder,
+                    WireFormat::OpenAiChat,
+                    delta(json!([call("call_after", None)])),
+                )?
+                .into_parts()
+                .1;
+        }
+        assert!(
+            matches!(
+                normalized.as_slice(),
+                [LlmResponseChunk::DecodeError { .. }]
+            ),
+            "{later}: {normalized:?}"
+        );
+    }
+    Ok(())
+}

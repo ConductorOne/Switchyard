@@ -248,13 +248,31 @@ fn decode_openai_chat_stream(
                 for tool_call in tool_calls {
                     if let Some(tool_call) = tool_call.as_object() {
                         let function = tool_call.get("function").and_then(Value::as_object);
-                        let id = tool_call.get("id").and_then(Value::as_str);
+                        let id = tool_call
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty());
                         let explicit_index = tool_call.get("index").and_then(Value::as_u64);
                         let index = match (explicit_index, id) {
                             (Some(index), _) => index as usize,
                             // Google's Chat endpoint streams each call whole and omits `index`;
                             // the call id is then the only identity, so key calls by it.
-                            (None, Some(id)) => unindexed_chat_tool_index(state, id),
+                            (None, Some(id)) => {
+                                match unindexed_chat_tool_index(state, id, function) {
+                                    Ok(index) => index,
+                                    Err(message) => {
+                                        return vec![LlmResponseChunk::DecodeError {
+                                            message: message.to_string(),
+                                        }];
+                                    }
+                                }
+                            }
+                            // Once calls are keyed by id, a fragment with neither cannot be placed.
+                            (None, None) if state.chat_unindexed_tool_calls => {
+                                return vec![LlmResponseChunk::DecodeError {
+                                    message: "Chat tool call has no index or id".to_string(),
+                                }];
+                            }
                             (None, None) => 0,
                         };
                         let tool = state.tool_states.entry(index).or_default();
@@ -365,20 +383,35 @@ fn decode_openai_chat_stream(
 }
 
 /// Index for a Chat tool call that carries an `id` but no `index`: the earlier call with
-/// that id, else the slot after every call seen so far.
-fn unindexed_chat_tool_index(state: &StreamTranslationState, id: &str) -> usize {
-    state
+/// that id, else the slot after every call seen so far. Unindexed calls arrive whole, so a
+/// second named call with a known id is a different call that reused the id.
+fn unindexed_chat_tool_index(
+    state: &mut StreamTranslationState,
+    id: &str,
+    function: Option<&Map<String, Value>>,
+) -> Result<usize, &'static str> {
+    state.chat_unindexed_tool_calls = true;
+    let known = state
         .tool_states
         .iter()
         .find(|(_, tool)| tool.decoded_chat_tool_id.as_deref() == Some(id))
-        .map(|(index, _)| *index)
-        .unwrap_or_else(|| {
-            state
-                .tool_states
-                .keys()
-                .next_back()
-                .map_or(0, |last| last + 1)
-        })
+        .map(|(index, _)| *index);
+    if let Some(index) = known {
+        let named = function
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+            .is_some_and(|name| !name.is_empty());
+        if named && state.pending_chat_tool_names.contains_key(&index) {
+            return Err("Chat tool call id is repeated");
+        }
+        return Ok(index);
+    }
+    match state.tool_states.keys().next_back() {
+        Some(last) => last
+            .checked_add(1)
+            .ok_or("Chat tool call index is out of range"),
+        None => Ok(0),
+    }
 }
 
 // Encodes neutral streaming events into OpenAI Chat chunks.

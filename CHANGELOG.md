@@ -18,6 +18,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Google Chat tool calls without indices** — streamed tool calls from Google's
+  Chat endpoint carry an `id` but no `index`; they are now keyed by id instead
+  of failing as unidentified signed calls.
 - Google-compatible Chat tool signatures now survive normalized request/response
   reconstruction, SSE accumulation, and synthetic streaming on the correct call.
   Repeated complete stream signatures are idempotent; conflicting values fail.
