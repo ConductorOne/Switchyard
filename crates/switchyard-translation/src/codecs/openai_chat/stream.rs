@@ -407,6 +407,7 @@ fn decode_openai_chat_stream(
                             .and_then(|function| function.get("arguments"))
                             .and_then(Value::as_str)
                             .map(ToOwned::to_owned);
+                        state.chat_tool_call_decoded = true;
                         out.push(LlmResponseChunk::ToolCallDelta {
                             index,
                             id: tool_call
@@ -433,11 +434,21 @@ fn decode_openai_chat_stream(
                 });
             }
             out.push(LlmResponseChunk::MessageStop {
-                reason: Some(reason.to_string()),
+                reason: Some(chat_finish_reason(reason, state.chat_tool_call_decoded).to_string()),
             });
         }
     }
     out
+}
+
+/// Some Chat providers (Google among them) end a turn that called tools with `stop`.
+/// Report it as a tool-call stop so other formats ask the client to run the tools.
+pub(crate) fn chat_finish_reason(reason: &str, called_tools: bool) -> &str {
+    if called_tools && reason == "stop" {
+        "tool_calls"
+    } else {
+        reason
+    }
 }
 
 /// Index for a Chat tool call that carries an `id` but no `index`: the earlier call with

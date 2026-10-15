@@ -1052,3 +1052,55 @@ fn google_unindexed_sse_rejects_unplaceable_or_reused_calls() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn chat_stop_after_tool_calls_is_a_tool_use_stop_in_other_formats() -> TestResult {
+    let engine = TranslationEngine::default();
+    // Streaming: Google ends a tool-calling turn with `finish_reason: "stop"`.
+    for (frames, expected) in [
+        (google_unindexed_stream_frames(), "tool_use"),
+        (
+            vec![
+                json!({"id": "google-text", "model": "gemini-provider", "choices": [{"index": 0,
+                    "delta": {"role": "assistant", "content": "done"}}]}),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+            ],
+            "end_turn",
+        ),
+    ] {
+        let mut decoder = StreamTranslationState::default();
+        let mut encoder =
+            StreamTranslationState::new(WireFormat::OpenAiChat, WireFormat::AnthropicMessages);
+        let mut output = Vec::new();
+        for frame in frames {
+            let event = engine.decode_stream_event(&mut decoder, WireFormat::OpenAiChat, frame)?;
+            output.extend(engine.encode_stream_event(
+                &mut encoder,
+                WireFormat::AnthropicMessages,
+                LlmResponseStreamEvent::new(event.into_parts().1),
+            )?);
+        }
+        output.extend(engine.finish_stream(&mut encoder, WireFormat::AnthropicMessages)?);
+        let stops: Vec<&Value> = output
+            .iter()
+            .filter(|event| event["type"] == "message_delta")
+            .map(|event| &event["delta"]["stop_reason"])
+            .collect();
+        assert_eq!(stops, [&json!(expected)], "{output:?}");
+    }
+    // Buffered: the same turn as one completion.
+    let mut body = response_body();
+    body["choices"][0]["finish_reason"] = json!("stop");
+    let response = engine
+        .decode_response(WireFormat::OpenAiChat, &body, &TranslationPolicy::default())?
+        .response;
+    let anthropic = engine
+        .encode_response(
+            WireFormat::AnthropicMessages,
+            &response,
+            &normalized_policy(),
+        )?
+        .body;
+    assert_eq!(anthropic["stop_reason"], "tool_use");
+    Ok(())
+}

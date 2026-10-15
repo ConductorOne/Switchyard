@@ -328,6 +328,9 @@ impl FormatCodec for OpenAiChatCodec {
                     }
                 }
             }
+            let called_tools = content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolCall(_)));
             response.outputs.push(ResponseOutput {
                 url_citations: message
                     .get("annotations")
@@ -342,7 +345,10 @@ impl FormatCodec for OpenAiChatCodec {
                 role: Role::Assistant,
                 content,
                 stop_reason: Some(map_openai_finish_reason(
-                    choice.get("finish_reason").and_then(Value::as_str),
+                    choice
+                        .get("finish_reason")
+                        .and_then(Value::as_str)
+                        .map(|reason| super::stream::chat_finish_reason(reason, called_tools)),
                 )),
             });
         }
