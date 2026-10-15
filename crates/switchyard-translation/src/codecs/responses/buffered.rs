@@ -626,6 +626,7 @@ fn decode_responses_input(
                             id,
                             name,
                             arguments: item.get("arguments").cloned().unwrap_or_else(|| json!({})),
+                            google_thought_signature: None,
                         });
                     }
                     kind @ (Some("function_call_output") | Some("custom_tool_call_output")) => {
@@ -713,6 +714,7 @@ fn decode_responses_input(
                             id,
                             name,
                             arguments: json!({crate::codex_custom_tools::INPUT_ARGUMENT: input}),
+                            google_thought_signature: None,
                         });
                     }
                     None => {
@@ -1825,6 +1827,7 @@ fn decode_responses_output_item(
                     .unwrap_or_default()
                     .to_string(),
                 arguments: item.get("arguments").cloned().unwrap_or_else(|| json!({})),
+                google_thought_signature: None,
             })],
             stop_reason: Some(StopReason::ToolUse),
         })),
@@ -1846,6 +1849,7 @@ fn decode_responses_output_item(
                     crate::codex_custom_tools::INPUT_ARGUMENT:
                         item.get("input").and_then(Value::as_str).unwrap_or_default()
                 }),
+                google_thought_signature: None,
             })],
             stop_reason: Some(StopReason::ToolUse),
         })),

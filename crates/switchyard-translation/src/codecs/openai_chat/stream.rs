@@ -5,14 +5,98 @@
 
 use serde_json::{Map, Value, json};
 
+use super::{decode_google_thought_signature, encode_google_thought_signature};
+
 use crate::LlmResponseChunk;
 use crate::codecs::common::{first_nonempty_string, reasoning_text_from_details};
 use crate::codecs::stream::{
-    StreamCodec, StreamTranslationState, record_source_identity, state_source_is, string_field,
+    StreamCodec, StreamTranslationState, record_source_identity, string_field,
     target_model_or_source_model,
 };
 use crate::format::{FormatId, WireFormat};
 use crate::llm::Usage;
+
+// Chat SDKs require a function object and append string fields. Keep other raw fields.
+pub(crate) fn prepare_google_tool_replay(state: &StreamTranslationState, event: &mut Value) {
+    for choice in event
+        .get_mut("choices")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        let Some(calls) = choice
+            .get_mut("delta")
+            .and_then(|delta| delta.get_mut("tool_calls"))
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        for position in 0..calls.len() {
+            // Borrow the retained first metadata instead of copying per-event state.
+            let (earlier, current) = calls.split_at_mut(position);
+            let (call, later) = current.split_first_mut().unwrap();
+            let Some(index) = call["index"].as_u64() else {
+                continue;
+            };
+            let signature = call["extra_content"]["google"]["thought_signature"].as_str();
+            let id = call.get("id").and_then(Value::as_str);
+            let tool = state.tool_states.get(&(index as usize));
+            let mut signed = signature.is_some()
+                || tool
+                    .and_then(|tool| tool.google_thought_signature.as_ref())
+                    .is_some();
+            let mut repeated = signature.is_some()
+                && tool.and_then(|tool| tool.google_thought_signature.as_deref()) == signature;
+            let mut repeated_id = id.is_some() && tool.and_then(|tool| tool.id.as_deref()) == id;
+            for previous in earlier
+                .iter()
+                .rev()
+                .filter(|call| call["index"].as_u64() == Some(index))
+            {
+                let previous_signature =
+                    previous["extra_content"]["google"]["thought_signature"].as_str();
+                signed |= previous_signature.is_some();
+                repeated |= signature.is_some() && previous_signature == signature;
+                repeated_id |= id.is_some() && previous.get("id").and_then(Value::as_str) == id;
+                if signed && repeated_id && (signature.is_none() || repeated) {
+                    break;
+                }
+            }
+            if !signed {
+                signed = later.iter().any(|call| {
+                    call["index"].as_u64() == Some(index)
+                        && call["extra_content"]["google"]["thought_signature"].is_string()
+                });
+            }
+            if !signed {
+                continue;
+            }
+            let Some(call) = call.as_object_mut() else {
+                continue;
+            };
+            if !call.contains_key("function") {
+                call.insert("function".to_string(), Value::Object(Map::new()));
+            }
+            if repeated_id {
+                call.remove("id");
+            }
+            if !repeated {
+                continue;
+            }
+            if let Some(extra) = call.get_mut("extra_content").and_then(Value::as_object_mut) {
+                if let Some(google) = extra.get_mut("google").and_then(Value::as_object_mut) {
+                    google.remove("thought_signature");
+                    if google.is_empty() {
+                        extra.remove("google");
+                    }
+                }
+                if extra.is_empty() {
+                    call.remove("extra_content");
+                }
+            }
+        }
+    }
+}
 
 /// Stream codec for OpenAI Chat Completions chunks.
 pub struct OpenAiChatStreamCodec;
@@ -63,6 +147,29 @@ fn decode_openai_chat_stream(
                 .and_then(Value::as_str)
                 .unwrap_or("unknown OpenAI stream error")
                 .to_string(),
+        }];
+    }
+
+    // Choice indexes share the old decoder's tool map. Never attach Google state
+    // after another choice could have overwritten a call at the same index.
+    let other_choice = object
+        .get("choices")
+        .and_then(Value::as_array)
+        .is_some_and(|choices| {
+            choices.len() > 1
+                || choices
+                    .iter()
+                    .any(|choice| choice["index"].as_u64().unwrap_or(0) != 0)
+        });
+    state.chat_other_choice_seen |= other_choice;
+    if other_choice
+        && state
+            .tool_states
+            .values()
+            .any(|tool| tool.decoded_google_thought_signature.is_some())
+    {
+        return vec![LlmResponseChunk::DecodeError {
+            message: "Google tool signature requires one Chat choice".to_string(),
         }];
     }
 
@@ -143,6 +250,66 @@ fn decode_openai_chat_stream(
                         let function = tool_call.get("function").and_then(Value::as_object);
                         let index =
                             tool_call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                        let id = tool_call.get("id").and_then(Value::as_str);
+                        let tool = state.tool_states.entry(index).or_default();
+                        if let Some(id) = id {
+                            tool.decoded_chat_tool_id_ambiguous |= tool
+                                .decoded_chat_tool_id
+                                .as_deref()
+                                .is_some_and(|previous| previous != id);
+                        }
+                        if tool.decoded_chat_tool_id_ambiguous
+                            && (tool.decoded_google_thought_signature.is_some()
+                                || tool_call
+                                    .get("extra_content")
+                                    .and_then(|extra| extra.get("google"))
+                                    .and_then(|google| google.get("thought_signature"))
+                                    .is_some())
+                        {
+                            return vec![LlmResponseChunk::DecodeError {
+                                message: "conflicting Chat tool call identity".to_string(),
+                            }];
+                        }
+                        if let Some(id) = id
+                            && tool.decoded_chat_tool_id.as_deref() != Some(id)
+                        {
+                            tool.decoded_chat_tool_id = Some(id.to_owned());
+                        }
+                        let google_thought_signature = match decode_google_thought_signature(
+                            tool_call,
+                        ) {
+                            Ok(Some(signature)) => {
+                                if tool_call.get("index").and_then(Value::as_u64).is_none()
+                                    || state.chat_other_choice_seen
+                                    || choice.get("index").and_then(Value::as_u64).unwrap_or(0) != 0
+                                {
+                                    return vec![LlmResponseChunk::DecodeError {
+                                            message: "Google tool signature requires an indexed call in one Chat choice".to_string(),
+                                        }];
+                                }
+                                let tool = state.tool_states.entry(index).or_default();
+                                match tool.decoded_google_thought_signature.as_deref() {
+                                    Some(previous) if previous != signature => {
+                                        return vec![LlmResponseChunk::DecodeError {
+                                            message: "conflicting Google tool signature"
+                                                .to_string(),
+                                        }];
+                                    }
+                                    Some(_) => None,
+                                    None => {
+                                        tool.decoded_google_thought_signature =
+                                            Some(signature.to_owned());
+                                        Some(signature.to_owned())
+                                    }
+                                }
+                            }
+                            Ok(None) => None,
+                            Err(error) => {
+                                return vec![LlmResponseChunk::DecodeError {
+                                    message: error.to_string(),
+                                }];
+                            }
+                        };
                         if let Some(name) = function
                             .and_then(|function| function.get("name"))
                             .and_then(Value::as_str)
@@ -167,6 +334,7 @@ fn decode_openai_chat_stream(
                             // Names may continue after arguments begin; emit them at finish_reason.
                             name: None,
                             arguments_delta,
+                            google_thought_signature,
                         });
                     }
                 }
@@ -179,6 +347,7 @@ fn decode_openai_chat_stream(
                     id: None,
                     name: Some(name),
                     arguments_delta: None,
+                    google_thought_signature: None,
                 });
             }
             out.push(LlmResponseChunk::MessageStop {
@@ -204,10 +373,11 @@ fn encode_openai_chat_stream(
             // `finish_openai_chat_stream` uses this flag to decide whether a clean EOF needs a
             // synthesized terminal chunk. Set it on the encode path as well as the decode path.
             state.saw_message_start = true;
-            if state.emitted_message_start
-                || (!state_source_is(state, WireFormat::AnthropicMessages)
-                    && !state_source_is(state, WireFormat::OpenAiResponses))
-            {
+            let emit_role = state.source.as_ref().is_some_and(|source| {
+                source.as_str() == WireFormat::AnthropicMessages.as_str()
+                    || source.as_str() == WireFormat::OpenAiResponses.as_str()
+            });
+            if state.emitted_message_start || !emit_role {
                 Vec::new()
             } else {
                 state.emitted_message_start = true;
@@ -261,12 +431,44 @@ fn encode_openai_chat_stream(
             id,
             name,
             arguments_delta,
+            google_thought_signature,
         } => {
             let tool = state.tool_states.entry(index).or_default();
+            let google_thought_signature = match google_thought_signature {
+                Some(signature) => match tool.google_thought_signature.as_ref() {
+                    Some(previous) if previous != &signature => {
+                        return encode_openai_chat_stream(
+                            state,
+                            LlmResponseChunk::DecodeError {
+                                message: "conflicting Google tool signature".to_string(),
+                            },
+                        );
+                    }
+                    Some(_) => None,
+                    None => {
+                        tool.google_thought_signature = Some(signature.clone());
+                        Some(signature)
+                    }
+                },
+                None => None,
+            };
+            let id = id.filter(|id| {
+                tool.google_thought_signature.is_none() || tool.id.as_ref() != Some(id)
+            });
+            if id.is_some() {
+                tool.id = id.clone();
+            }
             // Repeated full names would be concatenated by Chat clients as new fragments.
             let name = name.filter(|name| tool.name.as_ref() != Some(name));
             if name.is_some() {
                 tool.name = name.clone();
+            }
+            if id.is_none()
+                && name.is_none()
+                && arguments_delta.is_none()
+                && google_thought_signature.is_none()
+            {
+                return Vec::new();
             }
             // The source index counts every content block (Anthropic) or output item
             // (Responses), so text ahead of the first tool call shifts it. Chat clients use
@@ -281,13 +483,25 @@ fn encode_openai_chat_stream(
                     chat_index
                 }
             };
-            vec![openai_tool_call_chunk(
+            // The signature identifies Google Chat; keep other Chat streams unchanged.
+            let emit_role = google_thought_signature.is_some() && !state.emitted_message_start;
+            let tool_event = openai_tool_call_chunk(
                 state,
                 chat_index,
                 id,
                 name,
                 arguments_delta,
-            )]
+                google_thought_signature,
+            );
+            if emit_role {
+                state.emitted_message_start = true;
+                vec![
+                    openai_stream_chunk(state, json!({"role": "assistant"}), None, None),
+                    tool_event,
+                ]
+            } else {
+                vec![tool_event]
+            }
         }
         LlmResponseChunk::Usage(usage) => {
             state.usage = usage;
@@ -424,6 +638,7 @@ fn openai_tool_call_chunk(
     id: Option<String>,
     name: Option<String>,
     arguments: Option<String>,
+    google_thought_signature: Option<String>,
 ) -> Value {
     let mut function = Map::new();
     if let Some(name) = name {
@@ -439,12 +654,9 @@ fn openai_tool_call_chunk(
     if let Some(id) = id {
         tool_call.insert("id".to_string(), Value::String(id));
     }
-    openai_stream_chunk(
-        state,
-        json!({"tool_calls": [Value::Object(tool_call)]}),
-        None,
-        None,
-    )
+    let mut tool_call = Value::Object(tool_call);
+    encode_google_thought_signature(&mut tool_call, google_thought_signature.as_deref());
+    openai_stream_chunk(state, json!({"tool_calls": [tool_call]}), None, None)
 }
 
 // Builds OpenAI usage payloads from normalized and provider-extra state.

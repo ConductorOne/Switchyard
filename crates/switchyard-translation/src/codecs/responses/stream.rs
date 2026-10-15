@@ -203,6 +203,7 @@ fn decode_responses_stream(
                         id: None,
                         name: None,
                         arguments_delta: Some(delta.to_string()),
+                        google_thought_signature: None,
                     }]
                 })
                 .unwrap_or_default()
@@ -386,6 +387,7 @@ fn encode_responses_stream(
             id,
             name,
             arguments_delta,
+            ..
         } => encode_responses_tool_delta(state, index, id, name, arguments_delta),
         LlmResponseChunk::Usage(usage) => {
             state.usage = usage;
@@ -708,6 +710,7 @@ fn decode_responses_output_item_added(
         id: id.map(ToOwned::to_owned),
         name: name.map(ToOwned::to_owned),
         arguments_delta,
+        google_thought_signature: None,
     }]
 }
 
@@ -801,6 +804,7 @@ fn decode_responses_completed_item(
             id: id.filter(|_| needs_identity).map(ToOwned::to_owned),
             name: name.filter(|_| needs_identity).map(ToOwned::to_owned),
             arguments_delta,
+            google_thought_signature: None,
         }];
     }
     Vec::new()

@@ -403,6 +403,7 @@ fn responses_replay_without_sequence_advances_by_one_emitted_event() -> TestResu
             id: Some("call_0".to_string()),
             name: Some("bash".to_string()),
             arguments_delta: None,
+            google_thought_signature: None,
         }],
     );
     let mut state = StreamTranslationState::new(format, format);
@@ -419,6 +420,7 @@ fn responses_replay_without_sequence_advances_by_one_emitted_event() -> TestResu
             id: None,
             name: None,
             arguments_delta: Some("{}".to_string()),
+            google_thought_signature: None,
         }]),
     )?;
 
@@ -2789,6 +2791,7 @@ fn responses_stream_synthesized_item_ids_are_unique_across_responses() -> TestRe
                 id: Some("call_x".into()),
                 name: Some("exec_command".into()),
                 arguments_delta: Some("{}".into()),
+                google_thought_signature: None,
             },
             LlmResponseChunk::TextDelta {
                 index: 2,

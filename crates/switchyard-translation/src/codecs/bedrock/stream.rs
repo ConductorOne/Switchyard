@@ -106,6 +106,7 @@ fn decode_content_start(object: &Map<String, Value>) -> Vec<LlmResponseChunk> {
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned),
             arguments_delta: None,
+            google_thought_signature: None,
         }]
     })
     .unwrap_or_default()
@@ -136,6 +137,7 @@ fn decode_content_delta(object: &Map<String, Value>) -> Vec<LlmResponseChunk> {
             id: None,
             name: None,
             arguments_delta: Some(input.to_string()),
+            google_thought_signature: None,
         }];
     }
     if let Some(reasoning) = delta.get("reasoningContent").and_then(Value::as_object)
@@ -193,6 +195,7 @@ fn encode_bedrock_event(state: &mut StreamTranslationState, event: LlmResponseCh
             id,
             name,
             arguments_delta,
+            ..
         } => encode_tool_delta(state, index, id, name, arguments_delta),
         LlmResponseChunk::Usage(usage) => {
             state.usage = usage;

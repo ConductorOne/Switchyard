@@ -353,6 +353,7 @@ fn decode_content_block(
                 .unwrap_or_default()
                 .to_string(),
             arguments: tool.get("input").cloned().unwrap_or_else(|| json!({})),
+            google_thought_signature: None,
         }));
     }
     if let Some(tool) = object.get("toolResult").and_then(Value::as_object) {

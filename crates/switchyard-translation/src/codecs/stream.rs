@@ -55,6 +55,9 @@ pub struct StreamTranslationState {
     pub(crate) tool_states: BTreeMap<usize, StreamToolState>,
     #[serde(default)]
     pub(crate) pending_chat_tool_names: BTreeMap<usize, String>,
+    /// Multiple Chat choices make later Google call identity ambiguous, even without indexes.
+    #[serde(default)]
+    pub(crate) chat_other_choice_seen: bool,
     #[serde(default)]
     pub(crate) active_anthropic_tool: Option<usize>,
     #[serde(default)]
@@ -126,6 +129,18 @@ pub(crate) struct StreamToolState {
     /// own state and encodes later, the field is empty and the duplicate is
     /// emitted.
     pub(crate) decoded_arguments: String,
+    /// Chat call identity observed by the decoder, separate from emitted identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) decoded_chat_tool_id: Option<String>,
+    /// Distinct unsigned IDs must not be reassociated with a later Google signature.
+    #[serde(default)]
+    pub(crate) decoded_chat_tool_id_ambiguous: bool,
+    /// Complete Google signature observed while decoding, separate from encoder state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) decoded_google_thought_signature: Option<String>,
+    /// Complete Google signature already emitted, so repeated snapshots are not appended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) google_thought_signature: Option<String>,
     #[serde(default)]
     pub(crate) has_decoded_identity: bool,
     pub(crate) pending_arguments: String,
@@ -317,7 +332,7 @@ pub(crate) fn encode_response_stream_event(
     }
     let (preservation, normalized) = event.into_parts();
     if let Some(preservation) = preservation {
-        let (source, raw) = preservation.into_parts();
+        let (source, mut raw) = preservation.into_parts();
         if let Err(error) = super::responses::validate_stream_output(&source, target, &raw) {
             return target_codec.encode_event(
                 state,
@@ -331,6 +346,9 @@ pub(crate) fn encode_response_stream_event(
             .iter()
             .any(|chunk| matches!(chunk, LlmResponseChunk::DecodeError { .. }));
         if &source == target && !has_decode_error {
+            if source.as_str() == WireFormat::OpenAiChat.as_str() {
+                super::openai_chat::prepare_google_tool_replay(state, &mut raw);
+            }
             // Exact replay bypasses the target encoder's emitted JSON, but the encoder must
             // still observe every normalized chunk. Otherwise `finish` starts from empty state:
             // a clean EOF after a nonterminal provider event can omit or synthesize malformed
@@ -389,15 +407,6 @@ pub(crate) fn target_message_id_or_source_message_id(
         .target_message_id
         .as_deref()
         .or(state.message_id.as_deref())
-}
-
-// Checks whether the current source format matches a built-in format.
-pub(crate) fn state_source_is(state: &StreamTranslationState, format: WireFormat) -> bool {
-    let format_id: FormatId = format.into();
-    match &state.source {
-        Some(source) => source == &format_id,
-        None => false,
-    }
 }
 
 // Reads a non-empty string field from an event object.

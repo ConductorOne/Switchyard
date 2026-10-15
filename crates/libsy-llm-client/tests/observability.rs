@@ -1168,6 +1168,7 @@ async fn stage_router_records_algorithm_owned_metrics() -> switchyard_libsy::Res
                         id: "call_1".to_string(),
                         name: "Bash".to_string(),
                         arguments: json!({"command": "cargo test"}),
+                        google_thought_signature: None,
                     })],
                 },
                 Message {

@@ -245,6 +245,10 @@ pub struct ToolCall {
     pub name: String,
     /// Parsed tool arguments.
     pub arguments: Value,
+    /// Opaque Google Chat continuation signature for this call, not reasoning text.
+    /// Hosts must remove it when selecting a non-Google upstream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub google_thought_signature: Option<String>,
 }
 
 /// Normalized tool result message content.
@@ -995,6 +999,7 @@ mod tests {
             id: "call-1".to_string(),
             name: "lookup".to_string(),
             arguments: json!({"query": "rust"}),
+            google_thought_signature: None,
         });
         assert_eq!(
             serde_json::to_value(tool_call)?,

@@ -110,6 +110,7 @@ fn decode_anthropic_stream(
                     id: None,
                     name: None,
                     arguments_delta: Some("{}".to_string()),
+                    google_thought_signature: None,
                 }]
             } else {
                 Vec::new()
@@ -228,6 +229,7 @@ fn encode_anthropic_stream(
             id,
             name,
             arguments_delta,
+            ..
         } => encode_anthropic_tool_delta(state, index, id, name, arguments_delta),
         LlmResponseChunk::Usage(usage) => {
             state.usage = usage;
@@ -413,6 +415,7 @@ fn decode_anthropic_content_block_start(
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
                 arguments_delta: block.get("input").and_then(tool_input_delta),
+                google_thought_signature: None,
             }]
         }
         _ => Vec::new(),
@@ -466,6 +469,7 @@ fn decode_anthropic_content_block_delta(
                     id: None,
                     name: None,
                     arguments_delta: Some(partial_json.to_string()),
+                    google_thought_signature: None,
                 }]
             })
             .unwrap_or_default(),

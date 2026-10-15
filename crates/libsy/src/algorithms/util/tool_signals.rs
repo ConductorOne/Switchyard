@@ -1366,6 +1366,7 @@ mod tests {
                 id: String::new(),
                 name: name.to_string(),
                 arguments: json!({}),
+                google_thought_signature: None,
             })],
         }
     }
@@ -1378,6 +1379,7 @@ mod tests {
                 id: String::new(),
                 name: "Bash".to_string(),
                 arguments: json!({"command": command}),
+                google_thought_signature: None,
             })],
         }
     }
@@ -1620,6 +1622,7 @@ mod tests {
                 id: id.to_string(),
                 name: name.to_string(),
                 arguments,
+                google_thought_signature: None,
             })],
         };
         let result = |id: &str, text: &str| Message {
@@ -1885,6 +1888,7 @@ mod tests {
                 id: String::new(),
                 name: "exec_command".to_string(),
                 arguments: cmd,
+                google_thought_signature: None,
             })],
         }
     }
@@ -2169,6 +2173,7 @@ mod tests {
                     id: String::new(),
                     name: "str_replace_based_edit_tool".to_string(),
                     arguments,
+                    google_thought_signature: None,
                 })],
             };
             let request = with_messages(vec![call, tr("print('hi')")]);
