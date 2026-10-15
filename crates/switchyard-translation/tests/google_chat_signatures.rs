@@ -921,3 +921,66 @@ fn google_signature_can_precede_first_call_id_and_stable_id_updates() -> TestRes
     }
     Ok(())
 }
+
+/// Google's Chat endpoint streams each call whole, without `index`, ends with
+/// `finish_reason: "stop"`, and repeats `usage` on every chunk.
+fn google_unindexed_stream_frames() -> Vec<Value> {
+    let usage = json!({"completion_tokens": 18, "prompt_tokens": 64, "total_tokens": 142});
+    vec![
+        json!({"id": "google-stream", "object": "chat.completion.chunk", "model": "gemini-provider",
+        "usage": usage, "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [
+            call("call_signed", Some(SIGNATURE)), call("call_unsigned", None)
+        ]}}]}),
+        // A repeated signature for a known call id stays bound to that call.
+        json!({"id": "google-stream", "object": "chat.completion.chunk", "model": "gemini-provider",
+        "usage": usage, "choices": [{"index": 0, "delta": {"tool_calls": [
+            {"id": "call_signed", "extra_content": {"google": {"thought_signature": SIGNATURE}}}
+        ]}}]}),
+        json!({"id": "google-stream", "object": "chat.completion.chunk", "model": "gemini-provider",
+            "usage": usage, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": "stop"}]}),
+    ]
+}
+
+#[test]
+fn google_unindexed_sse_calls_are_keyed_by_call_id() -> TestResult {
+    let engine = TranslationEngine::default();
+    for preserve_raw in [false, true] {
+        let mut decoder = StreamTranslationState::default();
+        let mut encoder = StreamTranslationState::default();
+        let mut output = Vec::new();
+        for frame in google_unindexed_stream_frames() {
+            let event = engine.decode_stream_event(&mut decoder, WireFormat::OpenAiChat, frame)?;
+            assert!(
+                !event
+                    .normalized()
+                    .iter()
+                    .any(|chunk| matches!(chunk, LlmResponseChunk::DecodeError { .. })),
+                "{:?}",
+                event.normalized()
+            );
+            let event = if preserve_raw {
+                event
+            } else {
+                LlmResponseStreamEvent::new(event.into_parts().1)
+            };
+            output.extend(engine.encode_stream_event(
+                &mut encoder,
+                WireFormat::OpenAiChat,
+                event,
+            )?);
+        }
+        output.extend(engine.finish_stream(&mut encoder, WireFormat::OpenAiChat)?);
+        assert!(
+            output.iter().all(|frame| frame.get("error").is_none()),
+            "{output:?}"
+        );
+        let (response, _) = normalize_and_encode(&engine, &output)?;
+        assert_normalized_calls(&response);
+        if !preserve_raw {
+            assert_stream_signature_mapping(&output);
+        }
+    }
+    let (response, _) = normalize_and_encode(&engine, &google_unindexed_stream_frames())?;
+    assert_normalized_calls(&response);
+    Ok(())
+}
