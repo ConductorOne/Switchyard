@@ -36,6 +36,7 @@ pub(crate) fn prepare_google_tool_replay(state: &StreamTranslationState, event: 
             let (earlier, current) = calls.split_at_mut(position);
             let (call, later) = current.split_first_mut().unwrap();
             let Some(index) = call["index"].as_u64() else {
+                prepare_unindexed_google_call(state, earlier, call);
                 continue;
             };
             let signature = call["extra_content"]["google"]["thought_signature"].as_str();
@@ -94,6 +95,63 @@ pub(crate) fn prepare_google_tool_replay(state: &StreamTranslationState, event: 
                     call.remove("extra_content");
                 }
             }
+        }
+    }
+}
+
+// Google omits `index`, so the call id is the only identity and stays on every update.
+fn prepare_unindexed_google_call(
+    state: &StreamTranslationState,
+    earlier: &[Value],
+    call: &mut Value,
+) {
+    let Some(id) = call.get("id").and_then(Value::as_str).map(str::to_owned) else {
+        return;
+    };
+    let signature = call["extra_content"]["google"]["thought_signature"]
+        .as_str()
+        .map(str::to_owned);
+    let mut seen = state
+        .tool_states
+        .values()
+        .filter(|tool| tool.id.as_deref() == Some(id.as_str()))
+        .filter_map(|tool| tool.google_thought_signature.as_deref())
+        .chain(
+            earlier
+                .iter()
+                .filter(|previous| {
+                    previous["index"].is_null()
+                        && previous.get("id").and_then(Value::as_str) == Some(id.as_str())
+                })
+                .filter_map(|previous| {
+                    previous["extra_content"]["google"]["thought_signature"].as_str()
+                }),
+        );
+    let (signed, repeated) = match signature.as_deref() {
+        Some(signature) => (true, seen.any(|previous| previous == signature)),
+        None => (seen.next().is_some(), false),
+    };
+    if !signed {
+        return;
+    }
+    let Some(call) = call.as_object_mut() else {
+        return;
+    };
+    if !call.contains_key("function") {
+        call.insert("function".to_string(), Value::Object(Map::new()));
+    }
+    if !repeated {
+        return;
+    }
+    if let Some(extra) = call.get_mut("extra_content").and_then(Value::as_object_mut) {
+        if let Some(google) = extra.get_mut("google").and_then(Value::as_object_mut) {
+            google.remove("thought_signature");
+            if google.is_empty() {
+                extra.remove("google");
+            }
+        }
+        if extra.is_empty() {
+            call.remove("extra_content");
         }
     }
 }

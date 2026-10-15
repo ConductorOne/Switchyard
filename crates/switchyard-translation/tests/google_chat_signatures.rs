@@ -976,7 +976,27 @@ fn google_unindexed_sse_calls_are_keyed_by_call_id() -> TestResult {
         );
         let (response, _) = normalize_and_encode(&engine, &output)?;
         assert_normalized_calls(&response);
-        if !preserve_raw {
+        if preserve_raw {
+            // Replay keeps each id, gives metadata-only updates a `function` object, and
+            // drops the repeated signature.
+            let calls: Vec<&Value> = output
+                .iter()
+                .filter_map(|frame| frame["choices"][0]["delta"]["tool_calls"].as_array())
+                .flatten()
+                .collect();
+            assert!(
+                calls
+                    .iter()
+                    .all(|call| call["id"].is_string() && call["function"].is_object())
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| call["extra_content"]["google"]["thought_signature"].is_string())
+                    .count(),
+                1
+            );
+        } else {
             assert_stream_signature_mapping(&output);
         }
     }
