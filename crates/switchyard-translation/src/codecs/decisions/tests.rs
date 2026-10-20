@@ -457,3 +457,23 @@ fn duplicate_system_one_keys_are_rejected_instead_of_overwritten() {
         "{error}"
     );
 }
+
+#[test]
+fn a_choice_without_a_description_describes_itself_for_system_one() {
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "input": "x",
+        "questions": [{
+            "type": "choice", "name": "q", "instructions": "?",
+            "choices": [{"value": "billing", "description": "Charges"}, {"value": "technical"}]
+        }]
+    });
+    let encoded = engine
+        .translate_request(OPENAI, TYPESAFE, &body, &rebuilt())
+        .unwrap()
+        .body;
+    assert_eq!(
+        encoded["questions"]["q"]["criteria"],
+        json!({"billing": "Charges", "technical": "technical"})
+    );
+}

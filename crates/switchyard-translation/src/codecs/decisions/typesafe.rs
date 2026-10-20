@@ -337,10 +337,10 @@ fn encode_question(question: &DecisionQuestion) -> Value {
             let criteria = choices
                 .iter()
                 .map(|choice| {
-                    (
-                        key_text(&choice.value),
-                        json!(choice.description.clone().unwrap_or_default()),
-                    )
+                    // System One needs a description per choice, so a bare value describes itself.
+                    let key = key_text(&choice.value);
+                    let description = choice.description.clone().unwrap_or_else(|| key.clone());
+                    (key, json!(description))
                 })
                 .collect();
             body.insert("criteria".to_string(), Value::Object(criteria));
