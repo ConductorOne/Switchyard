@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
+use crate::decision::{DecisionRequest, NamedDecisionAnswer};
 use crate::format::FormatId;
 
 /// Actor role normalized across provider APIs.
@@ -820,6 +821,9 @@ pub struct LlmRequest {
     pub reasoning: ReasoningParams,
     /// Whether the caller requested a streamed response.
     pub stream: bool,
+    /// Typed questions when this is a decision request. The input is in `messages`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<DecisionRequest>,
     /// Provider fields without first-class normalized equivalents.
     pub extensions: ProviderExtensions,
     /// Exact provider bodies used by codecs for lossless same-format round trips.
@@ -957,6 +961,9 @@ pub struct AggLlmResponse {
     pub model: Option<String>,
     /// Ordered response output items.
     pub outputs: Vec<ResponseOutput>,
+    /// Answers when this is a decision response, in question order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decisions: Option<Vec<NamedDecisionAnswer>>,
     /// Normalized token usage.
     pub usage: Usage,
     /// Nonsemantic response metadata.

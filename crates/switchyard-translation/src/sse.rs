@@ -67,6 +67,8 @@ pub(crate) fn is_terminal_event(format: WireFormat, event: &Value) -> bool {
         // path, because its carrier is AWS EventStream. Its semantic terminal is still
         // `messageStop`; a trailing `metadata` event may follow it.
         WireFormat::BedrockConverse => event.get("messageStop").is_some(),
+        // Decision responses are never streamed.
+        WireFormat::OpenAiDecisions | WireFormat::TypesafeSystemOne => false,
     }
 }
 

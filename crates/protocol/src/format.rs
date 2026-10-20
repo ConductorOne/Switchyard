@@ -23,6 +23,12 @@ pub enum WireFormat {
     /// Amazon Bedrock Converse API.
     #[serde(rename = "bedrock_converse")]
     BedrockConverse,
+    /// OpenAI-compatible Decisions API (`POST /v1/decisions`).
+    #[serde(rename = "openai_decisions")]
+    OpenAiDecisions,
+    /// TypeSafe System One API (`POST /v1/systemone`).
+    #[serde(rename = "typesafe_systemone")]
+    TypesafeSystemOne,
 }
 
 impl WireFormat {
@@ -33,6 +39,8 @@ impl WireFormat {
             Self::AnthropicMessages => "anthropic_messages",
             Self::OpenAiResponses => "openai_responses",
             Self::BedrockConverse => "bedrock_converse",
+            Self::OpenAiDecisions => "openai_decisions",
+            Self::TypesafeSystemOne => "typesafe_systemone",
         }
     }
 }

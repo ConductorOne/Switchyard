@@ -358,7 +358,9 @@ fn prepare_preserved_requests(
     preservation.requests.retain(|format, body| {
         let is_builtin = format.as_str() == WireFormat::OpenAiChat.as_str()
             || format.as_str() == WireFormat::OpenAiResponses.as_str()
-            || format.as_str() == WireFormat::AnthropicMessages.as_str();
+            || format.as_str() == WireFormat::AnthropicMessages.as_str()
+            || format.as_str() == WireFormat::OpenAiDecisions.as_str()
+            || format.as_str() == WireFormat::TypesafeSystemOne.as_str();
         let Some(body) = is_builtin.then_some(body).and_then(Value::as_object_mut) else {
             return false;
         };

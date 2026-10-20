@@ -228,7 +228,9 @@ fn stamp_streamed_response_model(
                 message.insert("model".to_string(), Value::String(served_model.to_string()));
             }
         }
-        WireFormat::BedrockConverse => {}
+        WireFormat::BedrockConverse
+        | WireFormat::OpenAiDecisions
+        | WireFormat::TypesafeSystemOne => {}
     }
 }
 

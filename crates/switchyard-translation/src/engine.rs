@@ -12,6 +12,7 @@ use crate::LlmResponseStreamEvent;
 use crate::codecs::FormatCodec;
 use crate::codecs::anthropic::AnthropicMessagesCodec;
 use crate::codecs::bedrock::BedrockConverseCodec;
+use crate::codecs::decisions::{OpenAiDecisionsCodec, TypesafeSystemOneCodec};
 use crate::codecs::openai_chat::OpenAiChatCodec;
 use crate::codecs::responses::OpenAiResponsesCodec;
 use crate::codecs::stream::{
@@ -19,7 +20,7 @@ use crate::codecs::stream::{
 };
 use crate::diagnostic::TranslationDiagnostic;
 use crate::error::{Result, TranslationError};
-use crate::format::FormatId;
+use crate::format::{FormatId, WireFormat};
 use crate::llm::{AggLlmResponse, LlmRequest, ProviderExtensions};
 use crate::policy::TranslationPolicy;
 
@@ -63,6 +64,8 @@ impl FormatRegistry {
         registry.register(BedrockConverseCodec);
         registry.register(AnthropicMessagesCodec);
         registry.register(OpenAiResponsesCodec);
+        registry.register(OpenAiDecisionsCodec);
+        registry.register(TypesafeSystemOneCodec);
         registry
     }
 
@@ -136,6 +139,7 @@ impl TranslationEngine {
         policy: &TranslationPolicy,
     ) -> Result<TranslationOutput> {
         let target = target.into();
+        ensure_request_family(request, &target)?;
         let encoded = self
             .registry
             .codec(target)?
@@ -156,6 +160,7 @@ impl TranslationEngine {
     ) -> Result<TranslationOutput> {
         let source = source.into();
         let target = target.into();
+        ensure_same_family(&source, &target)?;
         let decoded = self
             .registry
             .codec(source.clone())?
@@ -193,6 +198,17 @@ impl TranslationEngine {
         policy: &TranslationPolicy,
     ) -> Result<TranslationOutput> {
         let target = target.into();
+        let response_is_decision = response.decisions.is_some();
+        if response_is_decision != is_decision_format(&target) {
+            return Err(TranslationError::UnsupportedTranslation {
+                from: if response_is_decision {
+                    WireFormat::OpenAiDecisions.into()
+                } else {
+                    WireFormat::OpenAiChat.into()
+                },
+                to: target,
+            });
+        }
         let encoded = self
             .registry
             .codec(target)?
@@ -236,6 +252,7 @@ impl TranslationEngine {
     ) -> Result<TranslationOutput> {
         let source = source.into();
         let target = target.into();
+        ensure_same_family(&source, &target)?;
         let decoded = self
             .registry
             .codec(source.clone())?
@@ -331,6 +348,39 @@ impl TranslationEngine {
         let target_codec = self.stream_registry.codec(target)?;
         Ok(target_codec.finish(state))
     }
+}
+
+// Decision formats carry typed questions and answers, so they only translate to each other.
+fn is_decision_format(format: &FormatId) -> bool {
+    [WireFormat::OpenAiDecisions, WireFormat::TypesafeSystemOne]
+        .iter()
+        .any(|decision| format.as_str() == decision.as_str())
+}
+
+fn ensure_request_family(request: &LlmRequest, target: &FormatId) -> Result<()> {
+    let request_is_decision = request.decision.is_some();
+    if request_is_decision == is_decision_format(target) {
+        return Ok(());
+    }
+    // The request carries no source format, so name the family it belongs to.
+    Err(TranslationError::UnsupportedTranslation {
+        from: if request_is_decision {
+            WireFormat::OpenAiDecisions.into()
+        } else {
+            WireFormat::OpenAiChat.into()
+        },
+        to: target.clone(),
+    })
+}
+
+fn ensure_same_family(source: &FormatId, target: &FormatId) -> Result<()> {
+    if is_decision_format(source) == is_decision_format(target) {
+        return Ok(());
+    }
+    Err(TranslationError::UnsupportedTranslation {
+        from: source.clone(),
+        to: target.clone(),
+    })
 }
 
 // Attaches source and target formats to every diagnostic emitted across both passes.

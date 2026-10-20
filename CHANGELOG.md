@@ -11,6 +11,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **ConductorOne host integration** — provider-neutral native request/response
   content, Bedrock Converse translation, and OpenAI reasoning-field provenance
   remain available on top of the upstream 0.3 Rust APIs.
+- **Decision API translation** — `openai_decisions` (`POST /v1/decisions`) and
+  `typesafe_systemone` (`POST /v1/systemone`) codecs translate typed
+  predicate/choice/score questions and answers between the two formats. Decision
+  formats do not translate to conversation formats. `WireFormat` gains two
+  variants, so exhaustive matches need new arms.
 - **Typed routed-call failures** — embedders can classify provider failures with
   `RoutedCallFailure` and `RoutingDisposition`; the disposition controls
   candidate fallback without inferring policy from HTTP status. Exhausted

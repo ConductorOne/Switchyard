@@ -273,6 +273,7 @@ impl FormatCodec for OpenAiChatCodec {
     ) -> Result<DecodedResponse> {
         let object = object(body, "$")?;
         let mut response = AggLlmResponse {
+            decisions: None,
             id: object
                 .get("id")
                 .and_then(Value::as_str)
