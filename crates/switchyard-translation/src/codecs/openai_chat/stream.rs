@@ -7,6 +7,7 @@ use serde_json::{Map, Value, json};
 
 use super::{decode_google_thought_signature, encode_google_thought_signature};
 
+use super::buffered::{decode_openai_usage, encode_openai_usage};
 use crate::LlmResponseChunk;
 use crate::codecs::common::{first_nonempty_string, reasoning_text_from_details};
 use crate::codecs::stream::{
@@ -14,7 +15,6 @@ use crate::codecs::stream::{
     target_model_or_source_model,
 };
 use crate::format::{FormatId, WireFormat};
-use crate::llm::Usage;
 
 // Chat SDKs require a function object and append string fields. Keep other raw fields.
 pub(crate) fn prepare_google_tool_replay(state: &StreamTranslationState, event: &mut Value) {
@@ -249,8 +249,8 @@ fn decode_openai_chat_stream(
         });
     }
 
-    if let Some(usage) = object.get("usage").and_then(Value::as_object) {
-        let usage = openai_usage(usage);
+    if let Some(usage) = object.get("usage").filter(|usage| usage.is_object()) {
+        let usage = decode_openai_usage(Some(usage));
         state.usage = usage.clone();
         state.saw_backend_usage = true;
         out.push(LlmResponseChunk::Usage(usage));
@@ -297,6 +297,17 @@ fn decode_openai_chat_stream(
             if let Some(text) = delta.get("content").and_then(Value::as_str)
                 && !text.is_empty()
             {
+                out.push(LlmResponseChunk::TextDelta {
+                    index: 0,
+                    text: text.to_string(),
+                });
+            }
+            if let Some(text) = delta.get("refusal").and_then(Value::as_str)
+                && !text.is_empty()
+            {
+                // Refusal deltas mark the whole message as a content-filter stop. This state
+                // persists across chunks so a later `finish_reason: "stop"` cannot overwrite it.
+                state.stop_reason = Some("content_filter".to_string());
                 out.push(LlmResponseChunk::TextDelta {
                     index: 0,
                     text: text.to_string(),
@@ -433,6 +444,12 @@ fn decode_openai_chat_stream(
                     google_thought_signature: None,
                 });
             }
+            let reason =
+                if reason == "stop" && state.stop_reason.as_deref() == Some("content_filter") {
+                    "content_filter"
+                } else {
+                    reason
+                };
             out.push(LlmResponseChunk::MessageStop {
                 reason: Some(chat_finish_reason(reason, state.chat_tool_call_decoded).to_string()),
             });
@@ -661,7 +678,9 @@ fn encode_openai_chat_stream(
                 state,
                 json!({}),
                 Some(openai_finish_reason(reason.as_deref())),
-                state.saw_backend_usage.then(|| openai_usage_value(state)),
+                state
+                    .saw_backend_usage
+                    .then(|| encode_openai_usage(&state.usage)),
             )]
         }
         LlmResponseChunk::DecodeError { message } | LlmResponseChunk::StreamError { message } => {
@@ -683,46 +702,10 @@ fn finish_openai_chat_stream(state: &mut StreamTranslationState) -> Vec<Value> {
         state,
         json!({}),
         Some(openai_finish_reason(state.stop_reason.as_deref())),
-        state.saw_backend_usage.then(|| openai_usage_value(state)),
+        state
+            .saw_backend_usage
+            .then(|| encode_openai_usage(&state.usage)),
     )]
-}
-
-// Normalizes OpenAI token usage fields.
-fn openai_usage(usage: &Map<String, Value>) -> Usage {
-    let cached_input_tokens = usage
-        .get("prompt_tokens_details")
-        .and_then(|details| details.get("cached_tokens"))
-        .and_then(Value::as_u64);
-    let cache_creation_input_tokens = usage
-        .get("prompt_tokens_details")
-        .and_then(|details| {
-            details
-                .get("cache_write_tokens")
-                .or_else(|| details.get("cache_creation_tokens"))
-        })
-        .and_then(Value::as_u64);
-    Usage {
-        input_tokens: usage
-            .get("prompt_tokens")
-            .and_then(Value::as_u64)
-            .map(|tokens| {
-                tokens
-                    .saturating_sub(cached_input_tokens.unwrap_or(0))
-                    .saturating_sub(cache_creation_input_tokens.unwrap_or(0))
-            }),
-        cache: Usage::cache_details(cached_input_tokens, cache_creation_input_tokens),
-        output_tokens: usage.get("completion_tokens").and_then(Value::as_u64),
-        total_tokens: usage.get("total_tokens").and_then(Value::as_u64),
-        reasoning_tokens: usage
-            .get("completion_tokens_details")
-            .and_then(|details| details.get("reasoning_tokens"))
-            .or_else(|| {
-                usage
-                    .get("output_tokens_details")
-                    .and_then(|details| details.get("reasoning_tokens"))
-            })
-            .and_then(Value::as_u64),
-    }
 }
 
 // Builds a single OpenAI Chat stream chunk payload.
@@ -751,7 +734,12 @@ fn openai_stream_chunk(
 
 // Builds the usage-only chunk OpenAI emits after the terminal choices chunk.
 fn openai_usage_chunk(state: &StreamTranslationState) -> Value {
-    let mut payload = openai_stream_chunk(state, json!({}), None, Some(openai_usage_value(state)));
+    let mut payload = openai_stream_chunk(
+        state,
+        json!({}),
+        None,
+        Some(encode_openai_usage(&state.usage)),
+    );
     payload["choices"] = json!([]);
     payload
 }
@@ -782,34 +770,6 @@ fn openai_tool_call_chunk(
     let mut tool_call = Value::Object(tool_call);
     encode_google_thought_signature(&mut tool_call, google_thought_signature.as_deref());
     openai_stream_chunk(state, json!({"tool_calls": [tool_call]}), None, None)
-}
-
-// Builds OpenAI usage payloads from normalized and provider-extra state.
-fn openai_usage_value(state: &StreamTranslationState) -> Value {
-    let cache_creation_tokens = state.usage.cache_creation_input_tokens().unwrap_or(0);
-    let cache_read_tokens = state.usage.cached_input_tokens().unwrap_or(0);
-    let prompt_tokens =
-        state.usage.input_tokens.unwrap_or(0) + cache_creation_tokens + cache_read_tokens;
-    let completion_tokens = state.usage.output_tokens.unwrap_or(0);
-    let mut usage = json!({
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": state.usage.total_tokens.unwrap_or(prompt_tokens + completion_tokens),
-    });
-    if let Some(reasoning_tokens) = state.usage.reasoning_tokens {
-        usage["completion_tokens_details"] = json!({
-            "reasoning_tokens": reasoning_tokens,
-        });
-    }
-    if state.usage.cache_creation_input_tokens().is_some()
-        || state.usage.cached_input_tokens().is_some()
-    {
-        usage["prompt_tokens_details"] = json!({
-            "cached_tokens": cache_read_tokens,
-            "cache_creation_tokens": cache_creation_tokens,
-        });
-    }
-    usage
 }
 
 // Converts any upstream message ID into an OpenAI-looking stream ID.

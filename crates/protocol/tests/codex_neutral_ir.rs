@@ -38,6 +38,7 @@ fn content_block_kind(block: &ContentBlock) -> &'static str {
         ContentBlock::CustomToolResult(_) => "custom_tool_result",
         ContentBlock::ComputerToolCall(_) => "computer_tool_call",
         ContentBlock::ComputerToolResult(_) => "computer_tool_result",
+        ContentBlock::Mcp(_) => "mcp",
         ContentBlock::HostedToolCall(_) => "hosted_tool_call",
         ContentBlock::HostedToolResult(_) => "hosted_tool_result",
         ContentBlock::OpaqueState(_) => "opaque_state",
@@ -222,6 +223,7 @@ fn block_uses_escape_hatch(block: &ContentBlock) -> bool {
         | ContentBlock::Compaction(_)
         | ContentBlock::GeneratedImage(_)
         | ContentBlock::PauseTurn(_)
+        | ContentBlock::Mcp(_)
         | ContentBlock::Refusal { .. } => false,
     }
 }

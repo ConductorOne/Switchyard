@@ -14,9 +14,9 @@ use crate::codecs::openai_media::image_payload;
 use crate::codecs::{
     DecodedRequest, DecodedResponse, EncodedRequest, EncodedResponse, FormatCodec,
 };
-use crate::decision::{
-    DecisionAnswer, DecisionChoice, DecisionKind, DecisionLevel, DecisionProbability,
-    DecisionQuestion, DecisionRequest, NamedDecisionAnswer,
+use crate::decision_wire::{
+    NamedWireDecisionAnswer, WireDecisionAnswer, WireDecisionChoice, WireDecisionKind,
+    WireDecisionLevel, WireDecisionProbability, WireDecisionQuestion, WireDecisionRequest,
 };
 use crate::error::{Result, TranslationError};
 use crate::format::{FormatId, WireFormat};
@@ -50,7 +50,7 @@ impl FormatCodec for OpenAiDecisionsCodec {
         let request = LlmRequest {
             model: optional_str(object, "model").filter(|model| !model.is_empty()),
             messages: decode_input(object.get("input"))?,
-            decision: Some(DecisionRequest { questions }),
+            decision: Some(WireDecisionRequest { questions }),
             extensions: ProviderExtensions {
                 fields: provider_extensions(object, REQUEST_FIELDS),
             },
@@ -83,10 +83,10 @@ impl FormatCodec for OpenAiDecisionsCodec {
             .iter()
             .flat_map(|decision| &decision.questions)
         {
-            if let DecisionKind::Boolean {
+            if let WireDecisionKind::Boolean {
                 true_case: Some(_), ..
             }
-            | DecisionKind::Boolean {
+            | WireDecisionKind::Boolean {
                 false_case: Some(_),
                 ..
             } = &question.kind
@@ -189,14 +189,14 @@ impl FormatCodec for OpenAiDecisionsCodec {
     }
 }
 
-fn decode_question(question: &Value, path: &str) -> Result<DecisionQuestion> {
+fn decode_question(question: &Value, path: &str) -> Result<WireDecisionQuestion> {
     let question = object(question, path)?;
     let kind = match required_str(question, "type", path)? {
-        "predicate" => DecisionKind::Boolean {
+        "predicate" => WireDecisionKind::Boolean {
             true_case: None,
             false_case: None,
         },
-        "choice" => DecisionKind::Choice {
+        "choice" => WireDecisionKind::Choice {
             choices: required_array(question, "choices", path)?
                 .iter()
                 .enumerate()
@@ -210,21 +210,21 @@ fn decode_question(question: &Value, path: &str) -> Result<DecisionQuestion> {
                         .ok_or_else(|| {
                             invalid(&path, "choice value must be a string or boolean")
                         })?;
-                    Ok(DecisionChoice {
+                    Ok(WireDecisionChoice {
                         value,
                         description: optional_str(choice, "description"),
                     })
                 })
                 .collect::<Result<_>>()?,
         },
-        "score" => DecisionKind::Score {
+        "score" => WireDecisionKind::Score {
             levels: required_array(question, "levels", path)?
                 .iter()
                 .enumerate()
                 .map(|(index, level)| {
                     let path = format!("{path}.levels[{index}]");
                     let level = object(level, &path)?;
-                    Ok(DecisionLevel {
+                    Ok(WireDecisionLevel {
                         label: required_str(level, "label", &path)?.to_string(),
                         description: optional_str(level, "description"),
                     })
@@ -238,21 +238,21 @@ fn decode_question(question: &Value, path: &str) -> Result<DecisionQuestion> {
             ));
         }
     };
-    Ok(DecisionQuestion {
+    Ok(WireDecisionQuestion {
         name: optional_str(question, "name"),
         instructions: required_str(question, "instructions", path)?.to_string(),
         kind,
     })
 }
 
-fn encode_question(question: &DecisionQuestion) -> Value {
+fn encode_question(question: &WireDecisionQuestion) -> Value {
     let mut body = Map::new();
     body.insert(
         "type".to_string(),
         json!(match question.kind {
-            DecisionKind::Boolean { .. } => "predicate",
-            DecisionKind::Choice { .. } => "choice",
-            DecisionKind::Score { .. } => "score",
+            WireDecisionKind::Boolean { .. } => "predicate",
+            WireDecisionKind::Choice { .. } => "choice",
+            WireDecisionKind::Score { .. } => "score",
         }),
     );
     if let Some(name) = &question.name {
@@ -260,8 +260,8 @@ fn encode_question(question: &DecisionQuestion) -> Value {
     }
     body.insert("instructions".to_string(), json!(question.instructions));
     match &question.kind {
-        DecisionKind::Boolean { .. } => {}
-        DecisionKind::Choice { choices } => {
+        WireDecisionKind::Boolean { .. } => {}
+        WireDecisionKind::Choice { choices } => {
             let choices = choices.iter().map(|choice| {
                 let mut item = json!({"value": choice.value});
                 if let Some(description) = &choice.description {
@@ -271,7 +271,7 @@ fn encode_question(question: &DecisionQuestion) -> Value {
             });
             body.insert("choices".to_string(), Value::Array(choices.collect()));
         }
-        DecisionKind::Score { levels } => {
+        WireDecisionKind::Score { levels } => {
             let levels = levels.iter().map(|level| {
                 let mut item = json!({"label": level.label});
                 if let Some(description) = &level.description {
@@ -384,7 +384,7 @@ fn encode_input(request: &LlmRequest) -> Result<Value> {
 fn decode_probabilities(
     answer: &Map<String, Value>,
     path: &str,
-) -> Result<Vec<DecisionProbability>> {
+) -> Result<Vec<WireDecisionProbability>> {
     let Some(items) = answer.get("probabilities") else {
         return Ok(Vec::new());
     };
@@ -400,7 +400,7 @@ fn decode_probabilities(
         .map(|(index, item)| {
             let path = format!("{path}.probabilities[{index}]");
             let item = object(item, &path)?;
-            Ok(DecisionProbability {
+            Ok(WireDecisionProbability {
                 value: item
                     .get("value")
                     .cloned()
@@ -412,15 +412,15 @@ fn decode_probabilities(
         .collect()
 }
 
-fn decode_answer(answer: &Value, path: &str) -> Result<NamedDecisionAnswer> {
+fn decode_answer(answer: &Value, path: &str) -> Result<NamedWireDecisionAnswer> {
     let answer = object(answer, path)?;
     let name = optional_str(answer, "name");
     let confidence = answer.get("confidence").and_then(Value::as_f64);
     let decoded = match required_str(answer, "type", path)? {
-        "predicate" => DecisionAnswer::Boolean {
+        "predicate" => WireDecisionAnswer::Boolean {
             probability: required_f64(answer, "probability", path)?,
         },
-        "choice" => DecisionAnswer::Choice {
+        "choice" => WireDecisionAnswer::Choice {
             choice: answer
                 .get("choice")
                 .cloned()
@@ -428,12 +428,12 @@ fn decode_answer(answer: &Value, path: &str) -> Result<NamedDecisionAnswer> {
             confidence,
             probabilities: decode_probabilities(answer, path)?,
         },
-        "score" => DecisionAnswer::Score {
+        "score" => WireDecisionAnswer::Score {
             score: required_f64(answer, "score", path)?,
             confidence,
             probabilities: decode_probabilities(answer, path)?,
         },
-        "refusal" => DecisionAnswer::Refusal,
+        "refusal" => WireDecisionAnswer::Refusal,
         other => {
             return Err(invalid(
                 &format!("{path}.type"),
@@ -441,13 +441,13 @@ fn decode_answer(answer: &Value, path: &str) -> Result<NamedDecisionAnswer> {
             ));
         }
     };
-    Ok(NamedDecisionAnswer {
+    Ok(NamedWireDecisionAnswer {
         name,
         answer: decoded,
     })
 }
 
-fn encode_probabilities(probabilities: &[DecisionProbability]) -> Value {
+fn encode_probabilities(probabilities: &[WireDecisionProbability]) -> Value {
     Value::Array(
         probabilities
             .iter()
@@ -463,22 +463,22 @@ fn encode_probabilities(probabilities: &[DecisionProbability]) -> Value {
     )
 }
 
-fn encode_answer(answer: &NamedDecisionAnswer) -> Value {
+fn encode_answer(answer: &NamedWireDecisionAnswer) -> Value {
     let mut body = Map::new();
     let kind = match &answer.answer {
-        DecisionAnswer::Boolean { .. } => "predicate",
-        DecisionAnswer::Choice { .. } => "choice",
-        DecisionAnswer::Score { .. } => "score",
-        DecisionAnswer::Refusal => "refusal",
+        WireDecisionAnswer::Boolean { .. } => "predicate",
+        WireDecisionAnswer::Choice { .. } => "choice",
+        WireDecisionAnswer::Score { .. } => "score",
+        WireDecisionAnswer::Refusal => "refusal",
     };
     body.insert("type".to_string(), json!(kind));
     // An unnamed question comes back as `name: null`.
     body.insert("name".to_string(), json!(answer.name));
     match &answer.answer {
-        DecisionAnswer::Boolean { probability } => {
+        WireDecisionAnswer::Boolean { probability } => {
             body.insert("probability".to_string(), json!(probability));
         }
-        DecisionAnswer::Choice {
+        WireDecisionAnswer::Choice {
             choice,
             confidence,
             probabilities,
@@ -494,7 +494,7 @@ fn encode_answer(answer: &NamedDecisionAnswer) -> Value {
                 );
             }
         }
-        DecisionAnswer::Score {
+        WireDecisionAnswer::Score {
             score,
             confidence,
             probabilities,
@@ -510,7 +510,7 @@ fn encode_answer(answer: &NamedDecisionAnswer) -> Value {
                 );
             }
         }
-        DecisionAnswer::Refusal => {}
+        WireDecisionAnswer::Refusal => {}
     }
     Value::Object(body)
 }

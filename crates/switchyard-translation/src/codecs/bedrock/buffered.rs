@@ -14,8 +14,8 @@ use crate::error::{Result, TranslationError};
 use crate::format::{FormatId, WireFormat};
 use crate::llm::{
     AggLlmResponse, ContentBlock, ImageSource, InstructionBlock, LlmRequest, Message, OutputParams,
-    ProviderExtensions, ResponseOutput, Role, SamplingParams, StopReason, ToolCall, ToolChoice,
-    ToolDefinition, ToolResult, Usage,
+    ProviderExtensions, ResponseOutput, Role, SamplingParams, StopReason, Tool, ToolCall,
+    ToolChoice, ToolDefinition, ToolResult, Usage,
 };
 use crate::policy::TranslationPolicy;
 use crate::util::{
@@ -50,6 +50,7 @@ impl FormatCodec for BedrockConverseCodec {
                     .and_then(|value| value.get("maxTokens"))
                     .and_then(Value::as_u64),
                 response_format: None,
+                is_schema_enforced: None,
             },
             preservation: capture_request_preservation(
                 WireFormat::BedrockConverse,
@@ -98,7 +99,10 @@ impl FormatCodec for BedrockConverseCodec {
             }
         }
         if let Some(tool_config) = body.get("toolConfig").and_then(Value::as_object) {
-            request.tools = decode_tools(tool_config.get("tools"));
+            request.tools = decode_tools(tool_config.get("tools"))
+                .into_iter()
+                .map(Tool::Function)
+                .collect();
             request.tool_choice = tool_config.get("toolChoice").map(decode_tool_choice);
         }
         if let Some(stop_sequences) = inference.and_then(|value| value.get("stopSequences")) {
@@ -186,10 +190,18 @@ impl FormatCodec for BedrockConverseCodec {
         if !request.tools.is_empty() || request.tool_choice.is_some() {
             let mut config = Map::new();
             if !request.tools.is_empty() {
-                config.insert(
-                    "tools".to_string(),
-                    Value::Array(request.tools.iter().map(encode_tool).collect()),
-                );
+                let mut tools = Vec::with_capacity(request.tools.len());
+                for tool in &request.tools {
+                    match tool {
+                        Tool::Function(definition) => tools.push(encode_tool(definition)),
+                        _ => {
+                            return Err(TranslationError::LossyConversion(
+                                "Bedrock Converse carries only function tools".to_string(),
+                            ));
+                        }
+                    }
+                }
+                config.insert("tools".to_string(), Value::Array(tools));
             }
             if let Some(choice) = &request.tool_choice {
                 config.insert("toolChoice".to_string(), encode_tool_choice(choice));

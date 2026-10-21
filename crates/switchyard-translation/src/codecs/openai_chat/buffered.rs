@@ -14,6 +14,7 @@ use crate::codecs::common::{
 use crate::codecs::openai_media::{
     ImagePayload, file_payload, file_source_text, image_payload, image_source_text,
 };
+use crate::codecs::structured_output::{decode_openai_schema_enforcement, encode_openai_format};
 use crate::codecs::{
     DecodedRequest, DecodedResponse, EncodedRequest, EncodedResponse, FormatCodec,
 };
@@ -23,7 +24,7 @@ use crate::format::{FormatId, WireFormat};
 use crate::llm::{
     AggLlmResponse, ContentBlock, FileSource, ImageSource, InstructionBlock, LlmRequest,
     MediaSource, Message, OpenAiChatReasoningField, OutputParams, ProviderExtensions,
-    ReasoningParams, ResponseOutput, Role, SamplingParams, StopReason, ToolCall, ToolChoice,
+    ReasoningParams, ResponseOutput, Role, SamplingParams, StopReason, Tool, ToolCall, ToolChoice,
     ToolDefinition, ToolResult, Usage,
 };
 use crate::policy::{DeterministicIdPolicy, TranslationPolicy};
@@ -62,6 +63,7 @@ impl FormatCodec for OpenAiChatCodec {
                     .or_else(|| body.get("max_tokens"))
                     .and_then(Value::as_u64),
                 response_format: body.get("response_format").cloned(),
+                is_schema_enforced: decode_openai_schema_enforcement(body.get("response_format")),
             },
             reasoning: ReasoningParams {
                 effort: body
@@ -141,7 +143,7 @@ impl FormatCodec for OpenAiChatCodec {
                         content: vec![ContentBlock::ToolResult(ToolResult {
                             tool_call_id,
                             content: vec![ContentBlock::Text { text }],
-                            is_error: None,
+                            is_error: message.get("is_error").and_then(Value::as_bool),
                         })],
                     });
                     continue;
@@ -159,7 +161,10 @@ impl FormatCodec for OpenAiChatCodec {
             }
         }
 
-        request.tools = decode_openai_tools(body.get("tools"), &mut diagnostics, policy)?;
+        request.tools = decode_openai_tools(body.get("tools"), &mut diagnostics, policy)?
+            .into_iter()
+            .map(Tool::from)
+            .collect();
         request.tool_choice = body.get("tool_choice").map(decode_openai_tool_choice);
         request.extensions.fields = provider_extensions(
             body,
@@ -234,7 +239,7 @@ impl FormatCodec for OpenAiChatCodec {
         body.insert("messages".to_string(), Value::Array(messages));
 
         if !tools.is_empty() {
-            body.insert("tools".to_string(), encode_openai_tools(tools));
+            body.insert("tools".to_string(), encode_openai_tools(tools)?);
             if let Some(choice) = tool_choice {
                 body.insert("tool_choice".to_string(), encode_openai_tool_choice(choice));
             }
@@ -257,8 +262,8 @@ impl FormatCodec for OpenAiChatCodec {
                 Value::String(effort.clone()),
             );
         }
-        if let Some(format) = &request.output.response_format {
-            body.insert("response_format".to_string(), format.clone());
+        if let Some(format) = encode_openai_format(&request.output, &mut diagnostics, policy)? {
+            body.insert("response_format".to_string(), format);
         }
         copy_openai_chat_request_extensions(&mut body, &request.extensions.fields);
 
@@ -272,6 +277,18 @@ impl FormatCodec for OpenAiChatCodec {
         _policy: &TranslationPolicy,
     ) -> Result<DecodedResponse> {
         let object = object(body, "$")?;
+        // `abort`, `error` and `repetition` mean the generation did not complete.
+        if let Some(reason @ ("abort" | "error" | "repetition")) = object
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("finish_reason"))
+            .and_then(Value::as_str)
+        {
+            return Err(TranslationError::UpstreamFailure {
+                error: json!({ "message": format!("provider finished with finish_reason \"{reason}\"") }),
+            });
+        }
         let mut response = AggLlmResponse {
             decisions: None,
             id: object
@@ -306,6 +323,10 @@ impl FormatCodec for OpenAiChatCodec {
                 .and_then(Value::as_object)
                 .cloned()
                 .unwrap_or_default();
+            let refusal = message
+                .get("refusal")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty());
             let mut content = match message.get("content") {
                 // decode_openai_content would turn absent response text into an empty text block.
                 None | Some(Value::Null) => Vec::new(),
@@ -318,6 +339,11 @@ impl FormatCodec for OpenAiChatCodec {
                 )?,
             };
             prepend_openai_reasoning_blocks(&mut content, &message);
+            if let Some(text) = refusal {
+                content.push(ContentBlock::Refusal {
+                    text: text.to_string(),
+                });
+            }
             if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
                 for (index, tool_call) in tool_calls.iter().enumerate() {
                     if let Some(call) = decode_openai_tool_call(
@@ -332,6 +358,15 @@ impl FormatCodec for OpenAiChatCodec {
             let called_tools = content
                 .iter()
                 .any(|block| matches!(block, ContentBlock::ToolCall(_)));
+            let finish_reason = choice.get("finish_reason").and_then(Value::as_str);
+            let stop_reason = if refusal.is_some() && matches!(finish_reason, Some("stop") | None) {
+                StopReason::ContentFilter
+            } else {
+                map_openai_finish_reason(
+                    finish_reason
+                        .map(|reason| super::stream::chat_finish_reason(reason, called_tools)),
+                )
+            };
             response.outputs.push(ResponseOutput {
                 url_citations: message
                     .get("annotations")
@@ -345,12 +380,7 @@ impl FormatCodec for OpenAiChatCodec {
                     .collect(),
                 role: Role::Assistant,
                 content,
-                stop_reason: Some(map_openai_finish_reason(
-                    choice
-                        .get("finish_reason")
-                        .and_then(Value::as_str)
-                        .map(|reason| super::stream::chat_finish_reason(reason, called_tools)),
-                )),
+                stop_reason: Some(stop_reason),
             });
         }
 
@@ -1053,6 +1083,8 @@ fn copy_openai_chat_request_extensions(
         "service_tier",
         "store",
         "stream_options",
+        // `top_logprobs` is only valid alongside `logprobs`.
+        "logprobs",
         "top_logprobs",
         "user",
     ] {
@@ -1078,6 +1110,14 @@ pub(crate) fn encode_openai_content(
     diagnostics: &mut Vec<TranslationDiagnostic>,
     policy: &TranslationPolicy,
 ) -> Result<Value> {
+    if content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Mcp(_)))
+    {
+        return Err(TranslationError::LossyConversion(
+            "MCP history encoding is not implemented".into(),
+        ));
+    }
     let has_non_text = content.iter().any(|block| {
         matches!(
             block,
@@ -1137,6 +1177,11 @@ pub(crate) fn encode_openai_content(
                     "OpenAI Chat codec does not have a stable video request mapping yet",
                 )?;
                 blocks.push(openai_text_part(&media_source_text(source)));
+            }
+            ContentBlock::Mcp(_) => {
+                return Err(TranslationError::LossyConversion(
+                    "MCP history encoding is not implemented".into(),
+                ));
             }
             ContentBlock::Unknown { provider, raw } => {
                 reject_responses_builtin_tool_item(provider, raw, WireFormat::OpenAiChat)?;
@@ -1210,11 +1255,16 @@ fn media_source_text(source: &MediaSource) -> String {
 }
 
 /// Encodes normalized tool definitions into OpenAI tool JSON.
-pub(crate) fn encode_openai_tools(tools: &[ToolDefinition]) -> Value {
-    Value::Array(
+pub(crate) fn encode_openai_tools(tools: &[Tool]) -> Result<Value> {
+    Ok(Value::Array(
         tools
             .iter()
             .map(|tool| {
+                let tool = tool.function().ok_or_else(|| {
+                    TranslationError::LossyConversion(
+                        "MCP and provider tool encoding is not implemented".into(),
+                    )
+                })?;
                 let mut function = json!({
                     "name": tool.name,
                     "description": tool.description.clone().unwrap_or_default(),
@@ -1223,10 +1273,10 @@ pub(crate) fn encode_openai_tools(tools: &[ToolDefinition]) -> Value {
                 if let Some(strict) = tool.strict {
                     function["strict"] = Value::Bool(strict);
                 }
-                json!({"type": "function", "function": function})
+                Ok(json!({"type": "function", "function": function}))
             })
-            .collect(),
-    )
+            .collect::<Result<_>>()?,
+    ))
 }
 
 /// Encodes normalized tool choice into OpenAI Chat JSON.
@@ -1258,6 +1308,7 @@ pub(crate) fn decode_openai_usage(value: Option<&Value>) -> Usage {
         })
         .and_then(Value::as_u64);
     Usage {
+        provider_cost: crate::codecs::common::provider_cost(value),
         input_tokens: value
             .get("prompt_tokens")
             .and_then(Value::as_u64)
@@ -1266,7 +1317,11 @@ pub(crate) fn decode_openai_usage(value: Option<&Value>) -> Usage {
                     .saturating_sub(cached_input_tokens.unwrap_or(0))
                     .saturating_sub(cache_creation_input_tokens.unwrap_or(0))
             }),
-        cache: Usage::cache_details(cached_input_tokens, cache_creation_input_tokens),
+        cache: crate::codecs::common::cache_usage_details(
+            value,
+            cached_input_tokens,
+            cache_creation_input_tokens,
+        ),
         output_tokens: value.get("completion_tokens").and_then(Value::as_u64),
         total_tokens: value.get("total_tokens").and_then(Value::as_u64),
         reasoning_tokens: value
@@ -1305,7 +1360,7 @@ pub(crate) fn encode_openai_usage(usage: &Usage) -> Value {
             "reasoning_tokens": reasoning_tokens,
         });
     }
-    value
+    crate::codecs::common::encode_usage_metadata(value, usage)
 }
 
 /// Maps OpenAI finish reasons to normalized stop reasons.

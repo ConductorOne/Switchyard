@@ -8,6 +8,7 @@ It supports OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages.
 | Goal | Path | Start here |
 |---|---|---|
 | Run Switchyard as a standalone proxy for API clients | Server Path | [Build and run the Rust server](getting_started.md#server-path) |
+| Route Codex or Claude Code using your existing login | Server Path | [Single-provider coding agents](recipes/single_provider_coding_agents.md) |
 | Add Switchyard routing to a Rust application | Library Path | [`switchyard-libsy`](../crates/libsy/README.md) |
 | Add Switchyard routing to NeMo Relay | Native Plugin Path | [Use Switchyard with NeMo Relay](integrations/nemo_relay.md) |
 | Point the pi coding agent at the standalone proxy | Server Path | [Use Switchyard with pi](integrations/pi.md) |
@@ -17,12 +18,15 @@ The Server Path builds and runs the standalone `switchyard-server` binary.
 
 ## Explore
 
+- [Benchmarks](benchmarks.md): compare Terminal-Bench 2.1 and DeepSWE results and open their routing configs
 - [Core Concepts](core_concepts.md): learn the LLM client, target, and route layers
 - [Routing Algorithms](routing_algorithms/overview.md): choose how requests select a model
 - [Architecture](architecture.md): understand the proxy and library components
 - [Server CLI Reference](cli_reference.md): inspect `switchyard-server` commands and options
 - [Rust API](reference/rust_api.md): browse libsy and protocol crate documentation
 - [Context-Window Handling](operations/context_window.md): configure eviction and retry behavior
+- [Tuning](tuning/index.md): the loop from verifying routing to recording a result
+- [Troubleshooting](operations/troubleshooting.md): symptoms, silent misconfigurations, and fixes
 
 ## Reference
 
@@ -31,3 +35,4 @@ The Server Path builds and runs the standalone `switchyard-server` binary.
 - [`switchyard-protocol`](reference/rust_api.md#switchyard-protocol): provider-neutral API types
 - [`switchyard-translation`](../crates/switchyard-translation/README.md): protocol translation
 - [`switchyard-nemo-relay-plugin`](../crates/switchyard-nemo-relay-plugin/README.md): native plugin build and configuration
+- [Dynamo / agentgateway](../examples/dynamo-preproc/README.md): Switchyard PreProc integration example
