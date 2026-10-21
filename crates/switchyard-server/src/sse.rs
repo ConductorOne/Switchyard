@@ -81,7 +81,10 @@ fn frame_event(
 ) -> Result<Event, serde_json::Error> {
     let data = redactor.json(serde_json::to_string(&value)?);
     match target_format {
-        WireFormat::OpenAiChat | WireFormat::BedrockConverse => Ok(Event::default().data(data)),
+        WireFormat::OpenAiChat
+        | WireFormat::BedrockConverse
+        | WireFormat::OpenAiDecisions
+        | WireFormat::TypesafeSystemOne => Ok(Event::default().data(data)),
         WireFormat::AnthropicMessages | WireFormat::OpenAiResponses => {
             let event_type = value
                 .get("type")
@@ -95,13 +98,22 @@ fn frame_event(
 
 fn error_event(target_format: WireFormat, message: String, redactor: &Redactor) -> Event {
     match target_format {
-        WireFormat::OpenAiChat => Event::default().data(
+        WireFormat::OpenAiChat | WireFormat::OpenAiDecisions => Event::default().data(
             redactor.json(
                 json!({
                     "error": {
                         "message": message,
                         "type": "SwitchyardError",
                     }
+                })
+                .to_string(),
+            ),
+        ),
+        WireFormat::TypesafeSystemOne => Event::default().data(
+            redactor.json(
+                json!({
+                    "message": message,
+                    "error_type": "switchyard_error",
                 })
                 .to_string(),
             ),

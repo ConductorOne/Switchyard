@@ -341,6 +341,7 @@ impl FormatCodec for AnthropicMessagesCodec {
             });
         }
         let response = AggLlmResponse {
+            decisions: None,
             id: body
                 .get("id")
                 .and_then(Value::as_str)

@@ -295,6 +295,8 @@ fn format_key(format: WireFormat) -> &'static str {
         WireFormat::AnthropicMessages => "anthropic_messages",
         WireFormat::OpenAiResponses => "openai_responses",
         WireFormat::BedrockConverse => "bedrock_converse",
+        WireFormat::OpenAiDecisions => "openai_decisions",
+        WireFormat::TypesafeSystemOne => "typesafe_systemone",
     }
 }
 
@@ -588,6 +590,7 @@ fn request_fixture(format: WireFormat) -> Value {
             "additionalModelRequestFields": {"top_k": 20},
             "requestMetadata": {"trace": "bedrock-request"}
         }),
+        WireFormat::OpenAiDecisions | WireFormat::TypesafeSystemOne => unreachable!(),
     }
 }
 
@@ -751,5 +754,6 @@ fn response_fixture(format: WireFormat) -> Value {
             "metrics": {"latencyMs": 42},
             "additionalModelResponseFields": {"trace": "bedrock-response"}
         }),
+        WireFormat::OpenAiDecisions | WireFormat::TypesafeSystemOne => unreachable!(),
     }
 }
