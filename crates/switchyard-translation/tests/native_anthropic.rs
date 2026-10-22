@@ -290,9 +290,25 @@ fn opaque_native_fields_are_data_not_authority_for_host_extension_changes() -> T
     body["parallel_tool_calls"] = json!(true);
     body["tool_choice"] = json!({"type": "auto", "disable_parallel_tool_use": false});
     let native = NativeAnthropicRequest::decode(&body, &policy)?;
-    let mut edited = native.request().clone();
-    edited.extensions.fields.remove("parallel_tool_calls");
-    assert!(native.encode(&edited, &policy).is_err());
+    assert_eq!(native.encode(native.request(), &policy)?, body);
+    for requested in [Some(json!(false)), None] {
+        let mut edited = native.request().clone();
+        match requested {
+            Some(value) => {
+                edited
+                    .extensions
+                    .fields
+                    .insert("parallel_tool_calls".to_string(), value);
+            }
+            None => {
+                edited.extensions.fields.remove("parallel_tool_calls");
+            }
+        }
+        assert!(matches!(
+            native.encode(&edited, &policy),
+            Err(TranslationError::LossyConversion(_))
+        ));
+    }
     Ok(())
 }
 
