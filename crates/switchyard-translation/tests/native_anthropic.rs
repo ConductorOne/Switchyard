@@ -14,6 +14,7 @@ use switchyard_translation::{
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 fn native_body() -> Value {
+    // Opaque feature values are synthetic data, not a provider schema or verdict.
     json!({
         "model": "source-model",
         "max_tokens": 512,
@@ -42,6 +43,9 @@ fn native_body() -> Value {
         "output_config": {"effort": "low", "future_budget": {"opaque": 17},
             "format": {"type": "json_schema", "schema": {"type": "object"}, "future": true}},
         "context_management": {"edits": [{"type": "future_edit", "opaque": true}]},
+        "safeguards": {"synthetic_opaque_fixture": [
+            {"sentinel": "no-provider-schema"}, null, {"bytes": [0, 17, 255]}
+        ]},
         "future_request": {"nested": {"opaque": [true, null, {"value": "sample"}]}},
         "metadata": {"example": "synthetic"}
     })
@@ -50,6 +54,7 @@ fn native_body() -> Value {
 #[test]
 fn native_model_and_effort_edits_preserve_every_other_json_value() -> TestResult {
     let body = native_body();
+    let safeguards_bytes = serde_json::to_vec(&body["safeguards"])?;
     let policy = TranslationPolicy::default();
     let native = NativeAnthropicRequest::decode(&body, &policy)?;
     let mut edited = native.request().clone();
@@ -57,6 +62,10 @@ fn native_model_and_effort_edits_preserve_every_other_json_value() -> TestResult
     edited.reasoning.effort = Some("high".to_string());
     edited.preservation.requests.clear();
     let encoded = native.encode(&edited, &policy)?;
+    assert_eq!(
+        serde_json::to_vec(&encoded["safeguards"])?,
+        safeguards_bytes
+    );
     let mut expected = body;
     expected["model"] = json!("target-model");
     expected["output_config"]["effort"] = json!("high");
@@ -66,7 +75,12 @@ fn native_model_and_effort_edits_preserve_every_other_json_value() -> TestResult
     let mut continuation = next.request().clone();
     continuation.model = Some("next-model".to_string());
     expected["model"] = json!("next-model");
-    assert_eq!(next.encode(&continuation, &policy)?, expected);
+    let continued = next.encode(&continuation, &policy)?;
+    assert_eq!(
+        serde_json::to_vec(&continued["safeguards"])?,
+        safeguards_bytes
+    );
+    assert_eq!(continued, expected);
     Ok(())
 }
 
@@ -204,6 +218,11 @@ fn prompt_history_tool_and_schema_changes_fail_instead_of_replaying_stale_policy
     let mut decision = baseline.clone();
     decision.decision = Some(switchyard_translation::decision::DecisionRequest::default());
     changes.push(decision);
+    let mut trailing = baseline.clone();
+    trailing
+        .trailing_items
+        .push(switchyard_translation::TurnInputItem::RemoteCompaction);
+    changes.push(trailing);
     for mut edited in changes {
         edited.preservation.requests.clear();
         assert!(matches!(
