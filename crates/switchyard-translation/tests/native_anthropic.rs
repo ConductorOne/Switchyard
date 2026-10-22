@@ -106,16 +106,12 @@ fn scalar_and_extension_policy_edits_are_authoritative() -> TestResult {
     edited.reasoning.effort = None;
     edited.reasoning.raw = None;
     edited.extensions.fields.remove("context_management");
-    edited
-        .extensions
-        .fields
-        .insert("future_request".to_string(), json!({"restricted": true}));
+    edited.extensions.fields.remove("future_request");
     let mut expected = body;
     expected["model"] = json!("constrained-model");
     expected["stream"] = json!(false);
     expected["max_tokens"] = json!(64);
     expected["temperature"] = json!(0.25);
-    expected["future_request"] = json!({"restricted": true});
     expected["output_config"]
         .as_object_mut()
         .unwrap()
@@ -123,6 +119,7 @@ fn scalar_and_extension_policy_edits_are_authoritative() -> TestResult {
     let object = expected.as_object_mut().unwrap();
     object.remove("thinking");
     object.remove("context_management");
+    object.remove("future_request");
     assert_eq!(native.encode(&edited, &policy)?, expected);
     Ok(())
 }
@@ -204,11 +201,97 @@ fn prompt_history_tool_and_schema_changes_fail_instead_of_replaying_stale_policy
         .fields
         .insert("model".to_string(), json!("stale-model"));
     changes.push(collision);
+    let mut decision = baseline.clone();
+    decision.decision = Some(switchyard_translation::decision::DecisionRequest::default());
+    changes.push(decision);
     for mut edited in changes {
         edited.preservation.requests.clear();
         assert!(matches!(
             native.encode(&edited, &policy),
             Err(TranslationError::LossyConversion(_))
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn debug_is_redacted_when_nested_in_host_contexts() -> TestResult {
+    #[derive(Debug)]
+    struct Context {
+        native: NativeAnthropicRequest,
+    }
+
+    let context = Context {
+        native: NativeAnthropicRequest::decode(&native_body(), &TranslationPolicy::default())?,
+    };
+    assert_eq!(
+        context.native.request().model.as_deref(),
+        Some("source-model")
+    );
+    assert_eq!(
+        format!("{:?}", context.native),
+        "NativeAnthropicRequest { .. }"
+    );
+    assert_eq!(
+        format!("{context:?}"),
+        "Context { native: NativeAnthropicRequest { .. } }"
+    );
+    Ok(())
+}
+
+#[test]
+fn opaque_native_fields_are_data_not_authority_for_host_extension_changes() -> TestResult {
+    let policy = TranslationPolicy::default();
+    let mut body = native_body();
+    body["algorithm_state"] = json!({"opaque_caller_data": [1, 2]});
+    body["previous_response_id"] = json!("opaque-caller-state");
+    let native = NativeAnthropicRequest::decode(&body, &policy)?;
+    assert_eq!(native.encode(native.request(), &policy)?, body);
+
+    for (key, value) in [
+        ("algorithm_state", json!({"opaque_host_data": true})),
+        ("future_request", json!({"opaque_host_data": true})),
+        ("switchyard_codex_tool_namespaces", json!({"opaque": true})),
+        ("previous_response_id", json!("synthetic-state")),
+        ("classifier_state", json!({"opaque": true})),
+    ] {
+        let mut edited = native.request().clone();
+        edited.extensions.fields.insert(key.to_string(), value);
+        assert!(native.encode(&edited, &policy).is_err());
+    }
+    let mut edited = native.request().clone();
+    edited.extensions.fields.remove("algorithm_state");
+    edited.extensions.fields.remove("previous_response_id");
+    body.as_object_mut().unwrap().remove("algorithm_state");
+    body.as_object_mut().unwrap().remove("previous_response_id");
+    assert_eq!(native.encode(&edited, &policy)?, body);
+
+    // A caller field with the same name cannot turn a normalized control into
+    // a supported top-level policy edit.
+    body["parallel_tool_calls"] = json!(true);
+    body["tool_choice"] = json!({"type": "auto", "disable_parallel_tool_use": false});
+    let native = NativeAnthropicRequest::decode(&body, &policy)?;
+    let mut edited = native.request().clone();
+    edited.extensions.fields.remove("parallel_tool_calls");
+    assert!(native.encode(&edited, &policy).is_err());
+    Ok(())
+}
+
+#[test]
+fn native_internal_bookkeeping_keys_are_rejected_before_routing() -> TestResult {
+    for key in [
+        "_switchyard_translation",
+        "switchyard_anthropic_request",
+        "switchyard_codex_tool_namespaces",
+        "switchyard_codex_custom_tools",
+        "switchyard_codex_additional_tools",
+        "switchyard_codex_custom_call_outputs",
+    ] {
+        let mut body = native_body();
+        body[key] = json!({"opaque": true});
+        assert!(matches!(
+            NativeAnthropicRequest::decode(&body, &TranslationPolicy::default()),
+            Err(TranslationError::InvalidValue { .. })
         ));
     }
     Ok(())

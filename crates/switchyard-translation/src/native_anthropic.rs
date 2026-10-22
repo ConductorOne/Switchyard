@@ -4,8 +4,10 @@
 //! Checked edits to a native Anthropic request without rebuilding unchanged fields.
 
 use serde_json::{Map, Value};
+use switchyard_protocol::codex_namespaces::TOOL_NAMESPACES_KEY;
 
 use crate::codecs::common::ANTHROPIC_REQUEST_KEY;
+use crate::codex_custom_tools::{ADDITIONAL_TOOLS_KEY, CUSTOM_CALL_OUTPUTS_KEY, CUSTOM_TOOLS_KEY};
 use crate::util::{SWITCHYARD_METADATA_KEY, validate_request_capabilities};
 use crate::{
     ContentBlock, LlmRequest, LossyConversionPolicy, PreservationPolicy, Result, TranslationEngine,
@@ -17,10 +19,18 @@ use crate::{
 /// Keep this value outside the mutable IR. Use [`Self::encode`] after routing and
 /// policy edits, even when those edits cleared request preservation. Only the
 /// supported edits are applied; other changes fail rather than replay stale JSON.
-/// This type is not serializable and cannot encode a foreign provider format.
+/// Debug output is redacted. This type has no serialization or deserialization
+/// support and cannot encode a foreign provider format.
 pub struct NativeAnthropicRequest {
     body: Value,
     request: LlmRequest,
+}
+
+impl std::fmt::Debug for NativeAnthropicRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeAnthropicRequest")
+            .finish_non_exhaustive()
+    }
 }
 
 impl NativeAnthropicRequest {
@@ -29,6 +39,22 @@ impl NativeAnthropicRequest {
     /// Preservation is disabled in the returned IR so ordinary translation cannot
     /// recover this native body from a client-controlled metadata envelope.
     pub fn decode(body: &Value, policy: &TranslationPolicy) -> Result<Self> {
+        for key in [
+            SWITCHYARD_METADATA_KEY,
+            ANTHROPIC_REQUEST_KEY,
+            TOOL_NAMESPACES_KEY,
+            CUSTOM_TOOLS_KEY,
+            ADDITIONAL_TOOLS_KEY,
+            CUSTOM_CALL_OUTPUTS_KEY,
+        ] {
+            if body.get(key).is_some() {
+                return Err(TranslationError::InvalidValue {
+                    path: format!("$.{key}"),
+                    message: "internal request metadata is not accepted as native input"
+                        .to_string(),
+                });
+            }
+        }
         if body
             .get("metadata")
             .and_then(Value::as_object)
@@ -57,9 +83,10 @@ impl NativeAnthropicRequest {
     /// Encodes checked edits for the same native Anthropic target.
     ///
     /// Supports model, stream, sampling, maximum output tokens, raw thinking,
-    /// reasoning effort, and existing top-level extension updates/removals.
-    /// Changing instructions, messages, tools, tool choice, response format, or
-    /// other normalized fields returns an error. Edited preservation is ignored.
+    /// reasoning effort, and removal of existing native top-level extensions.
+    /// Changing instructions, messages, tools, tool choice, response format,
+    /// decision data, or extension values returns an error. Added extensions are
+    /// also rejected. Edited preservation is ignored.
     /// Declared target capability restrictions always reject incompatible input,
     /// even when the caller permits lossy translation.
     pub fn encode(&self, edited: &LlmRequest, policy: &TranslationPolicy) -> Result<Value> {
@@ -74,7 +101,9 @@ impl NativeAnthropicRequest {
         supported.extensions.clone_from(&edited.extensions);
         supported.preservation.clone_from(&edited.preservation);
         if supported != *edited {
-            return Err(unsupported_edit());
+            return Err(TranslationError::LossyConversion(
+                "native Anthropic structural and decision edits are unsupported".to_string(),
+            ));
         }
 
         let policy = native_policy(policy);
@@ -133,21 +162,14 @@ impl NativeAnthropicRequest {
             // These are normalized/internal fields, not native top-level keys.
             if key == ANTHROPIC_REQUEST_KEY {
                 if after.is_some() {
-                    return Err(unsupported_edit());
+                    return Err(unsupported_extension_edit());
                 }
                 continue;
             }
-            if !object.contains_key(key) {
-                return Err(unsupported_edit());
+            if after.is_some() || key == "parallel_tool_calls" || !object.contains_key(key) {
+                return Err(unsupported_extension_edit());
             }
-            match after {
-                Some(value) => {
-                    object.insert(key.clone(), value.clone());
-                }
-                None => {
-                    object.remove(key);
-                }
-            }
+            object.remove(key);
         }
         if edited
             .extensions
@@ -155,10 +177,9 @@ impl NativeAnthropicRequest {
             .keys()
             .any(|key| !self.request.extensions.fields.contains_key(key))
         {
-            return Err(unsupported_edit());
+            return Err(unsupported_extension_edit());
         }
-        // Re-decode the result so newly edited extension values cannot smuggle an
-        // embedded body into subsequent translation. No preserved IR is replayed.
+        // Check the emitted native values, not stale or injected preservation.
         let final_request = Self::decode(&body, &policy)?;
         validate_request_capabilities(final_request.request(), &mut Vec::new(), &policy)?;
         validate_native_capabilities(&body, final_request.request(), &policy)?;
@@ -177,6 +198,13 @@ fn native_policy(policy: &TranslationPolicy) -> TranslationPolicy {
 fn unsupported_edit() -> TranslationError {
     TranslationError::LossyConversion(
         "native Anthropic edit cannot be reconciled without rebuilding unchanged fields"
+            .to_string(),
+    )
+}
+
+fn unsupported_extension_edit() -> TranslationError {
+    TranslationError::LossyConversion(
+        "native Anthropic extensions support removal only; added, changed, or synthetic extension state is unsupported"
             .to_string(),
     )
 }

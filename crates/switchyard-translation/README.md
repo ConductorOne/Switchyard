@@ -33,19 +33,25 @@ native JSON values, including unknown fields, system arrays, tool metadata,
 message roles, content blocks and tool IDs.
 
 Supported edits are model, stream, sampling controls, maximum output tokens,
-raw thinking, effort, and updates or removals of existing top-level extensions.
+raw thinking, effort, and removal of existing native top-level extensions.
 Effort changes only `output_config.effort`; they keep other output and thinking
 settings. The host must choose a combination the target model accepts. Raw
-thinking replacement is a whole-field edit. Extension replacement is also a
-whole-field edit; unrelated top-level fields stay intact.
+thinking replacement is a whole-field edit. Unknown native extensions remain
+unchanged as caller data, or can be removed by policy. Changing extension values
+or adding keys fails; host or algorithm metadata never becomes provider authority
+through a generic extension merge. Changes to normalized `parallel_tool_calls`
+also fail because the native control belongs to `tool_choice`.
 
 Changes to instructions, message history, tools, tool choice, output schema,
-or new extension keys return an error. Do not retry that error by replaying the
+or typed `decision` data return an error. Do not retry that error by replaying the
 original body. Such changes need an explicitly supported native mapping or a
 separate route that allows reconstruction. Required prompts and policy edits
 must stay effective.
 
-Embedded `_switchyard_translation` metadata is rejected. Capability checks reject
+Embedded `_switchyard_translation` metadata and native top-level internal
+preservation, provenance and Codex bookkeeping keys are rejected. `Debug` output
+is redacted, including when this value is nested in a derived `Debug` context.
+The type has no serialization or deserialization support. Capability checks reject
 incompatible normalized content even if lossy conversion is allowed. Opaque
 content also fails when a content capability is disabled, since its compatibility
 cannot be checked. Native tools obey tool, parallel-tool and code-execution
