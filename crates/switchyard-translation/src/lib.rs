@@ -14,6 +14,7 @@ pub mod diagnostic;
 pub mod engine;
 pub mod error;
 mod helpers;
+mod native_anthropic;
 pub mod policy;
 mod sse;
 pub mod stream;
@@ -31,6 +32,7 @@ pub use error::*;
 pub use format::*;
 pub use helpers::*;
 pub use llm::*;
+pub use native_anthropic::NativeAnthropicRequest;
 pub use policy::*;
 pub use stream::*;
 pub use util::{
