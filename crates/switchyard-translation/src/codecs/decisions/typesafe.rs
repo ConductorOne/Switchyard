@@ -17,9 +17,9 @@ use crate::codecs::common::provider_extensions;
 use crate::codecs::{
     DecodedRequest, DecodedResponse, EncodedRequest, EncodedResponse, FormatCodec,
 };
-use crate::decision::{
-    DecisionAnswer, DecisionChoice, DecisionKind, DecisionLevel, DecisionProbability,
-    DecisionQuestion, DecisionRequest, NamedDecisionAnswer,
+use crate::decision_wire::{
+    NamedWireDecisionAnswer, WireDecisionAnswer, WireDecisionChoice, WireDecisionKind,
+    WireDecisionLevel, WireDecisionProbability, WireDecisionQuestion, WireDecisionRequest,
 };
 use crate::diagnostic::TranslationDiagnostic;
 use crate::error::{Result, TranslationError};
@@ -63,7 +63,7 @@ impl FormatCodec for TypesafeSystemOneCodec {
         let request = LlmRequest {
             model: optional_str(object, "model").filter(|model| !model.is_empty()),
             messages,
-            decision: Some(DecisionRequest { questions }),
+            decision: Some(WireDecisionRequest { questions }),
             extensions: ProviderExtensions {
                 fields: provider_extensions(object, REQUEST_FIELDS),
             },
@@ -217,7 +217,7 @@ fn warn_lossy_request(
         .flat_map(|decision| &decision.questions)
     {
         match &question.kind {
-            DecisionKind::Choice { choices }
+            WireDecisionKind::Choice { choices }
                 if choices.iter().any(|choice| !choice.value.is_string()) =>
             {
                 push_lossy(
@@ -226,7 +226,7 @@ fn warn_lossy_request(
                     "System One choice values are object keys; non-string values became strings",
                 )?;
             }
-            DecisionKind::Score { levels }
+            WireDecisionKind::Score { levels }
                 if levels.iter().any(|level| level.description.is_some()) =>
             {
                 push_lossy(
@@ -241,12 +241,12 @@ fn warn_lossy_request(
     Ok(())
 }
 
-fn decode_question(name: &str, question: &Value) -> Result<DecisionQuestion> {
+fn decode_question(name: &str, question: &Value) -> Result<WireDecisionQuestion> {
     let path = format!("$.questions.{name}");
     let question = object(question, &path)?;
     let criteria = question.get("criteria");
     let kind = match required_str(question, "type", &path)? {
-        "noul" => DecisionKind::Boolean {
+        "noul" => WireDecisionKind::Boolean {
             true_case: criteria
                 .and_then(|criteria| criteria.get("true"))
                 .and_then(Value::as_str)
@@ -256,7 +256,7 @@ fn decode_question(name: &str, question: &Value) -> Result<DecisionQuestion> {
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned),
         },
-        "choice" => DecisionKind::Choice {
+        "choice" => WireDecisionKind::Choice {
             choices: criteria
                 .and_then(Value::as_object)
                 .ok_or_else(|| {
@@ -266,13 +266,13 @@ fn decode_question(name: &str, question: &Value) -> Result<DecisionQuestion> {
                     )
                 })?
                 .iter()
-                .map(|(value, description)| DecisionChoice {
+                .map(|(value, description)| WireDecisionChoice {
                     value: json!(value),
                     description: description.as_str().map(ToOwned::to_owned),
                 })
                 .collect(),
         },
-        "score" => DecisionKind::Score {
+        "score" => WireDecisionKind::Score {
             levels: criteria
                 .and_then(Value::as_array)
                 .ok_or_else(|| {
@@ -282,7 +282,7 @@ fn decode_question(name: &str, question: &Value) -> Result<DecisionQuestion> {
                 .map(|label| {
                     label
                         .as_str()
-                        .map(|label| DecisionLevel {
+                        .map(|label| WireDecisionLevel {
                             label: label.to_string(),
                             description: None,
                         })
@@ -299,26 +299,26 @@ fn decode_question(name: &str, question: &Value) -> Result<DecisionQuestion> {
             ));
         }
     };
-    Ok(DecisionQuestion {
+    Ok(WireDecisionQuestion {
         name: Some(name.to_string()),
         instructions: required_str(question, "instructions", &path)?.to_string(),
         kind,
     })
 }
 
-fn encode_question(question: &DecisionQuestion) -> Value {
+fn encode_question(question: &WireDecisionQuestion) -> Value {
     let mut body = Map::new();
     body.insert(
         "type".to_string(),
         json!(match question.kind {
-            DecisionKind::Boolean { .. } => "noul",
-            DecisionKind::Choice { .. } => "choice",
-            DecisionKind::Score { .. } => "score",
+            WireDecisionKind::Boolean { .. } => "noul",
+            WireDecisionKind::Choice { .. } => "choice",
+            WireDecisionKind::Score { .. } => "score",
         }),
     );
     body.insert("instructions".to_string(), json!(question.instructions));
     match &question.kind {
-        DecisionKind::Boolean {
+        WireDecisionKind::Boolean {
             true_case,
             false_case,
         } => {
@@ -333,7 +333,7 @@ fn encode_question(question: &DecisionQuestion) -> Value {
                 body.insert("criteria".to_string(), Value::Object(criteria));
             }
         }
-        DecisionKind::Choice { choices } => {
+        WireDecisionKind::Choice { choices } => {
             let criteria = choices
                 .iter()
                 .map(|choice| {
@@ -345,7 +345,7 @@ fn encode_question(question: &DecisionQuestion) -> Value {
                 .collect();
             body.insert("criteria".to_string(), Value::Object(criteria));
         }
-        DecisionKind::Score { levels } => {
+        WireDecisionKind::Score { levels } => {
             // TypeSafe levels are single strings, so a description joins its label.
             let criteria = levels.iter().map(|level| match &level.description {
                 Some(description) => json!(format!("{}: {description}", level.label)),
@@ -387,7 +387,7 @@ fn decode_probabilities(
     answer: &Map<String, Value>,
     path: &str,
     indexed: bool,
-) -> Result<Vec<DecisionProbability>> {
+) -> Result<Vec<WireDecisionProbability>> {
     let Some(map) = answer.get("probabilities") else {
         return Ok(Vec::new());
     };
@@ -408,7 +408,7 @@ fn decode_probabilities(
                 .and_then(|legend| legend.get(key))
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned);
-            Ok(DecisionProbability {
+            Ok(WireDecisionProbability {
                 value,
                 label,
                 probability: probability
@@ -422,18 +422,18 @@ fn decode_probabilities(
         .collect()
 }
 
-fn decode_answer(name: &str, answer: &Value) -> Result<NamedDecisionAnswer> {
+fn decode_answer(name: &str, answer: &Value) -> Result<NamedWireDecisionAnswer> {
     let path = format!("$.answers.{name}");
     let answer = object(answer, &path)?;
     let confidence = answer.get("confidence").and_then(Value::as_f64);
     // A refused noul is reported as `refused: true` with `noul: 0`, not as its own type.
     let refused = answer.get("refused").and_then(Value::as_bool) == Some(true);
     let decoded = match required_str(answer, "type", &path)? {
-        _ if refused => DecisionAnswer::Refusal,
-        "noul" => DecisionAnswer::Boolean {
+        _ if refused => WireDecisionAnswer::Refusal,
+        "noul" => WireDecisionAnswer::Boolean {
             probability: required_f64(answer, "noul", &path)?,
         },
-        "choice" => DecisionAnswer::Choice {
+        "choice" => WireDecisionAnswer::Choice {
             choice: answer
                 .get("choice")
                 .cloned()
@@ -441,12 +441,12 @@ fn decode_answer(name: &str, answer: &Value) -> Result<NamedDecisionAnswer> {
             confidence,
             probabilities: decode_probabilities(answer, &path, false)?,
         },
-        "score" => DecisionAnswer::Score {
+        "score" => WireDecisionAnswer::Score {
             score: required_f64(answer, "score", &path)?,
             confidence,
             probabilities: decode_probabilities(answer, &path, true)?,
         },
-        "refusal" => DecisionAnswer::Refusal,
+        "refusal" => WireDecisionAnswer::Refusal,
         other => {
             return Err(invalid(
                 &format!("{path}.type"),
@@ -454,13 +454,13 @@ fn decode_answer(name: &str, answer: &Value) -> Result<NamedDecisionAnswer> {
             ));
         }
     };
-    Ok(NamedDecisionAnswer {
+    Ok(NamedWireDecisionAnswer {
         name: Some(name.to_string()),
         answer: decoded,
     })
 }
 
-fn encode_probabilities(probabilities: &[DecisionProbability]) -> Value {
+fn encode_probabilities(probabilities: &[WireDecisionProbability]) -> Value {
     Value::Object(
         probabilities
             .iter()
@@ -469,10 +469,10 @@ fn encode_probabilities(probabilities: &[DecisionProbability]) -> Value {
     )
 }
 
-fn encode_answer(answer: &DecisionAnswer) -> Value {
+fn encode_answer(answer: &WireDecisionAnswer) -> Value {
     match answer {
-        DecisionAnswer::Boolean { probability } => json!({"type": "noul", "noul": probability}),
-        DecisionAnswer::Choice {
+        WireDecisionAnswer::Boolean { probability } => json!({"type": "noul", "noul": probability}),
+        WireDecisionAnswer::Choice {
             choice,
             confidence,
             probabilities,
@@ -486,7 +486,7 @@ fn encode_answer(answer: &DecisionAnswer) -> Value {
                 "probabilities": encode_probabilities(probabilities),
             })
         }
-        DecisionAnswer::Score {
+        WireDecisionAnswer::Score {
             score,
             confidence,
             probabilities,
@@ -504,6 +504,6 @@ fn encode_answer(answer: &DecisionAnswer) -> Value {
             })
         }
         // Only a noul can be refused on this wire, as `refused: true` with `noul: 0`.
-        DecisionAnswer::Refusal => json!({"type": "noul", "noul": 0, "refused": true}),
+        WireDecisionAnswer::Refusal => json!({"type": "noul", "noul": 0, "refused": true}),
     }
 }

@@ -209,6 +209,9 @@ fn prompt_history_tool_and_schema_changes_fail_instead_of_replaying_stale_policy
     let mut format = baseline.clone();
     format.output.response_format = None;
     changes.push(format);
+    let mut enforcement = baseline.clone();
+    enforcement.output.is_schema_enforced = Some(false);
+    changes.push(enforcement);
     let mut collision = baseline.clone();
     collision
         .extensions
@@ -216,7 +219,7 @@ fn prompt_history_tool_and_schema_changes_fail_instead_of_replaying_stale_policy
         .insert("model".to_string(), json!("stale-model"));
     changes.push(collision);
     let mut decision = baseline.clone();
-    decision.decision = Some(switchyard_translation::decision::DecisionRequest::default());
+    decision.decision = Some(switchyard_translation::decision_wire::WireDecisionRequest::default());
     changes.push(decision);
     let mut trailing = baseline.clone();
     trailing

@@ -42,8 +42,8 @@ or adding keys fails; host or algorithm metadata never becomes provider authorit
 through a generic extension merge. Changes to normalized `parallel_tool_calls`
 also fail because the native control belongs to `tool_choice`.
 
-Changes to instructions, message history, tools, tool choice, output schema,
-or typed `decision` data return an error. Do not retry that error by replaying the
+Changes to instructions, message history, tools, tool choice, output schema or
+schema enforcement, or typed `decision` data return an error. Do not retry that error by replaying the
 original body. Such changes need an explicitly supported native mapping or a
 separate route that allows reconstruction. Required prompts and policy edits
 must stay effective.
