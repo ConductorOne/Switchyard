@@ -3,8 +3,9 @@
 
 //! Buffered codecs for decision APIs, which answer typed questions about shared input.
 //!
-//! Both formats map to [`LlmRequest::decision`] and [`AggLlmResponse::decisions`], so they
-//! translate to each other. Neither translates to a conversation format, because a chat model
+//! Both formats map to [`LlmRequest::decision`] and
+//! [`AggLlmResponse::decisions`](crate::llm::AggLlmResponse::decisions), so they translate to
+//! each other. Neither translates to a conversation format, because a chat model
 //! returns text, not typed answers.
 
 mod openai;

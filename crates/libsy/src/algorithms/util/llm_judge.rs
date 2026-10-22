@@ -170,6 +170,7 @@ where
                 output: OutputParams {
                     max_output_tokens: Some(self.runtime.max_output_tokens),
                     response_format: Some(self.contract.response_format().clone()),
+                    ..OutputParams::default()
                 },
                 ..LlmRequest::default()
             },
@@ -227,6 +228,7 @@ where
 {
     judge: J,
     policy: P,
+    recover_errors: bool,
     evidence: Option<EvidenceFn<J::Verdict, P>>,
 }
 
@@ -240,8 +242,15 @@ where
         Self {
             judge,
             policy,
+            recover_errors: false,
             evidence: None,
         }
+    }
+
+    /// Lets the judge policy recover from client failures, including deadlines.
+    pub(crate) fn with_error_recovery(mut self, enabled: bool) -> Self {
+        self.recover_errors = enabled;
+        self
     }
 
     /// Enables bounded evidence for built-in judges without widening the public policy trait.
@@ -284,14 +293,15 @@ where
     /// Consults the judge, yielding `None` when it is unavailable or unintelligible.
     ///
     /// A judge is an optimization, not a dependency: failing the caller's request because the
-    /// judge is down would be worse than routing without it, so every failure — transport,
-    /// mid-stream, or unparseable reply — is logged and folded into `None` for the policy's
-    /// fallback branch. A closed driver stream is folded too; the algorithm's next driver
-    /// call surfaces it, so nothing is masked.
+    /// judge is down would be worse than routing without it. Errors delivered by the host and
+    /// invalid verdicts are logged and folded into `None` for the policy's fallback branch;
+    /// a closed driver stream is folded too, and the algorithm's next driver call surfaces
+    /// it, so nothing is masked. The HTTP driver delivers client errors here when error
+    /// recovery is enabled; otherwise it stops the run.
     ///
     /// An unusable reply is reported to the host here. A parsed verdict comes back with the
     /// handle for that report, because only the policy can say whether it was usable.
-    async fn verdict(
+    pub(crate) async fn verdict(
         &self,
         state: &mut State,
         request: &Request,
@@ -304,7 +314,7 @@ where
         let judge_request = self.judge.build_request(state, request);
         let requested_max_output_tokens = judge_request.llm_request.output.max_output_tokens;
         let (response, assessor) = driver
-            .call_model_assessed(judge_request, judge_models.to_vec())
+            .call_model_assessed(judge_request, judge_models.to_vec(), self.recover_errors)
             .await
             .inspect_err(|error| {
                 self.report_fail_open(driver, safe_error_summary(error), libsy_error_reason(error));
@@ -374,6 +384,21 @@ where
     }
 }
 
+/// Logs and counts a judge failure with a bounded label that excludes message content.
+/// `error` must already be redacted: `LlmClientError::UpstreamHttp`'s `Display` interpolates the
+/// raw upstream body, which can quote the conversation back. Callers pass a
+/// `robustness::safe_*` summary rather than the error itself.
+pub(crate) fn report_fail_open(judge_model: &str, error: String, reason: &'static str) {
+    tracing::warn!(
+        target: "libsy",
+        judge_model,
+        reason,
+        error = %error,
+        "judge verdict unavailable; routing without one"
+    );
+    crate::observability::record_classifier_fail_open(judge_model, reason);
+}
+
 /// Returns a bounded reason for a judge call that failed at the libsy layer.
 pub(crate) fn libsy_error_reason(error: &LibsyError) -> &'static str {
     match error {
@@ -398,7 +423,7 @@ fn client_error_reason(error: &LlmClientError) -> &'static str {
 }
 
 #[async_trait]
-impl<J, P> Classifier<State> for JudgeClassifier<J, P>
+impl<J, P> Classifier for JudgeClassifier<J, P>
 where
     J: Judge,
     P: JudgePolicy<Verdict = J::Verdict>,
@@ -681,7 +706,7 @@ mod tests {
                 return None;
             };
             let assessment = call.take_assessment();
-            let _ = call.respond(reply);
+            let _ = call.respond(std::future::ready(reply)).await;
             assessment
         };
         let (classification, assessment) =

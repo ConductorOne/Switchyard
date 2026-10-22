@@ -1,7 +1,7 @@
 use serde_json::{Value, json};
 use switchyard_protocol::ModelId;
 
-use crate::decision::{DecisionAnswer, DecisionKind};
+use crate::decision_wire::{WireDecisionAnswer, WireDecisionKind};
 use crate::engine::TranslationEngine;
 use crate::error::TranslationError;
 use crate::format::WireFormat;
@@ -129,9 +129,14 @@ fn openai_request_decodes_questions_and_input() {
     let questions = decoded.decision.unwrap().questions;
     assert_eq!(questions.len(), 3);
     assert_eq!(questions[0].name.as_deref(), Some("damaged"));
-    assert!(matches!(questions[0].kind, DecisionKind::Boolean { .. }));
-    assert!(matches!(&questions[1].kind, DecisionKind::Choice { choices } if choices.len() == 2));
-    assert!(matches!(&questions[2].kind, DecisionKind::Score { levels } if levels.len() == 3));
+    assert!(matches!(
+        questions[0].kind,
+        WireDecisionKind::Boolean { .. }
+    ));
+    assert!(
+        matches!(&questions[1].kind, WireDecisionKind::Choice { choices } if choices.len() == 2)
+    );
+    assert!(matches!(&questions[2].kind, WireDecisionKind::Score { levels } if levels.len() == 3));
 }
 
 #[test]
@@ -264,7 +269,7 @@ fn refused_noul_decodes_as_refusal_and_encodes_back() {
         .response;
     assert_eq!(
         response.decisions.as_ref().unwrap()[0].answer,
-        DecisionAnswer::Refusal
+        WireDecisionAnswer::Refusal
     );
 
     let encoded = engine
