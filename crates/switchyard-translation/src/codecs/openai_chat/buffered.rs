@@ -8,8 +8,8 @@ use serde_json::{Map, Value, json};
 use super::{decode_google_thought_signature, encode_google_thought_signature};
 
 use crate::codecs::common::{
-    first_nonempty_string, is_known_role_name, provider_extensions, reasoning_text_from_blocks,
-    reasoning_text_from_details, text_from_blocks,
+    first_nonempty_string, is_known_role_name, new_response_id, provider_extensions,
+    reasoning_text_from_blocks, reasoning_text_from_details, text_from_blocks, unix_timestamp,
 };
 use crate::codecs::openai_media::{
     ImagePayload, file_payload, file_source_text, image_payload, image_source_text,
@@ -454,9 +454,9 @@ impl FormatCodec for OpenAiChatCodec {
         }
 
         let body = json!({
-            "id": response.id.clone().unwrap_or_else(|| "chatcmpl_switchyard".to_string()),
+            "id": response.id.clone().unwrap_or_else(|| new_response_id("chatcmpl")),
             "object": "chat.completion",
-            "created": 0,
+            "created": unix_timestamp(),
             "model": response.model.clone().unwrap_or_else(|| "unknown".to_string()),
             "choices": [{
                 "index": 0,

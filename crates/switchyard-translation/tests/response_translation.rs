@@ -5,6 +5,8 @@
 
 pub mod common;
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use switchyard_translation::{
@@ -16,6 +18,120 @@ use common::{
 };
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+#[test]
+fn bedrock_response_metadata_is_unique_and_recent() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "output": {"message": {"role": "assistant", "content": [{"text": "Hello"}]}},
+        "stopReason": "end_turn"
+    });
+    for (target, prefix, timestamp) in [
+        (WireFormat::OpenAiChat, "chatcmpl_", Some("created")),
+        (WireFormat::OpenAiResponses, "resp_", Some("created_at")),
+        (WireFormat::AnthropicMessages, "msg_", None),
+    ] {
+        let before = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let mut ids = std::collections::HashSet::new();
+        let mut item_ids = std::collections::HashSet::new();
+        for _ in 0..2 {
+            let output = engine
+                .translate_response(
+                    WireFormat::BedrockConverse,
+                    target,
+                    &body,
+                    &TranslationPolicy::default(),
+                )?
+                .body;
+            let id = output["id"].as_str().ok_or("missing response ID")?;
+            assert!(id.starts_with(prefix), "{target:?}: {id}");
+            assert!(ids.insert(id.to_string()), "{target:?}: duplicate ID {id}");
+            if target == WireFormat::OpenAiResponses {
+                let item_id = output["output"][0]["id"]
+                    .as_str()
+                    .ok_or("missing output message ID")?;
+                assert!(item_id.starts_with("msg_"));
+                assert!(
+                    item_ids.insert(item_id.to_string()),
+                    "duplicate output message ID"
+                );
+            }
+            if let Some(field) = timestamp {
+                let created = output[field].as_u64().ok_or("missing creation time")?;
+                let after = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+                assert!(created > 0 && (before..=after).contains(&created));
+            }
+            // The codec has no served model to infer from a Bedrock body.
+            assert_eq!(output["model"], "unknown");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn buffered_response_metadata_preserves_upstream_identity_and_exact_replay() -> TestResult {
+    let engine = TranslationEngine::default();
+    let bodies = [
+        (
+            WireFormat::OpenAiChat,
+            json!({
+                "id": "chatcmpl_upstream", "model": "served-upstream", "created": 123,
+                "choices": [{"message": {"role": "assistant", "content": "Hello"},
+                    "finish_reason": "stop"}],
+                "provider_metadata": {"keep": true}
+            }),
+        ),
+        (
+            WireFormat::OpenAiResponses,
+            json!({
+                "id": "resp_upstream", "model": "served-upstream", "created_at": 123,
+                "status": "completed",
+                "output": [{"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Hello"}]}],
+                "provider_metadata": {"keep": true}
+            }),
+        ),
+        (
+            WireFormat::AnthropicMessages,
+            json!({
+                "id": "msg_upstream", "model": "served-upstream",
+                "type": "message", "role": "assistant", "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "Hello"}],
+                "provider_metadata": {"keep": true}
+            }),
+        ),
+    ];
+    for (source, body) in bodies {
+        let replay = engine
+            .translate_response(source, source, &body, &TranslationPolicy::default())?
+            .body;
+        assert_eq!(replay, body, "{source:?}: exact same-format body");
+        for target in [
+            WireFormat::OpenAiChat,
+            WireFormat::OpenAiResponses,
+            WireFormat::AnthropicMessages,
+        ] {
+            if source == target {
+                continue;
+            }
+            let before = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+            let output = engine
+                .translate_response(source, target, &body, &TranslationPolicy::default())?
+                .body;
+            let after = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+            assert_eq!(output["id"], body["id"], "{source:?} -> {target:?}");
+            assert_eq!(output["model"], body["model"]);
+            let field = match target {
+                WireFormat::OpenAiChat => "created",
+                WireFormat::OpenAiResponses => "created_at",
+                _ => continue,
+            };
+            let created = output[field].as_u64().ok_or("missing creation time")?;
+            assert!(created > 0 && (before..=after).contains(&created));
+        }
+    }
+    Ok(())
+}
 
 #[test]
 fn responses_native_output_is_preserved_or_rejected() -> TestResult {

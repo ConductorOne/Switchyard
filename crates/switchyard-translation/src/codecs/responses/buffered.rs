@@ -9,8 +9,8 @@ use serde_json::{Map, Value, json};
 
 use crate::codecs::common::{
     collect_responses_reasoning_text, encrypted_reasoning_data, encrypted_reasoning_item_id,
-    is_anthropic_request, is_known_role_name, provider_extensions, reasoning_text_from_blocks,
-    text_from_blocks,
+    is_anthropic_request, is_known_role_name, new_response_id, provider_extensions,
+    reasoning_text_from_blocks, text_from_blocks, unix_timestamp,
 };
 use crate::codecs::openai_chat::{decode_file_source, decode_image_source};
 use crate::codecs::openai_media::{
@@ -451,9 +451,9 @@ impl FormatCodec for OpenAiResponsesCodec {
         Ok(EncodedResponse {
             body: embed_preservation(
                 json!({
-                    "id": response.id.clone().unwrap_or_else(|| "resp_switchyard".to_string()),
+                    "id": response.id.clone().unwrap_or_else(|| new_response_id("resp")),
                     "object": "response",
-                    "created_at": 0,
+                    "created_at": unix_timestamp(),
                     "model": response.model.clone().unwrap_or_else(|| "unknown".to_string()),
                     "status": status,
                     "incomplete_details": incomplete_details,
@@ -1999,7 +1999,7 @@ fn encode_responses_output(outputs: &[ResponseOutput]) -> Value {
                 if !text.is_empty() || (!has_output_items && reasoning.is_empty()) {
                     items.push(json!({
                         "type": "message",
-                        "id": "msg_switchyard",
+                        "id": new_response_id("msg"),
                         "status": status,
                         "role": role_to_responses(output.role),
                         "content": [{

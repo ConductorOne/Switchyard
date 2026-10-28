@@ -715,7 +715,7 @@ fn anthropic_stream_usage(state: &StreamTranslationState) -> Value {
 // Converts any upstream message ID into an Anthropic-looking message ID.
 fn anthropic_message_id(state: &StreamTranslationState) -> String {
     let Some(id) = target_message_id_or_source_message_id(state) else {
-        return "msg_switchyard".to_string();
+        return format!("msg_{}", state.generated_metadata.id);
     };
     if id.starts_with("msg_") {
         id.to_string()

@@ -6,6 +6,7 @@
 pub mod common;
 
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
@@ -17,6 +18,173 @@ use switchyard_translation::{
 use common::{REASONING_MODEL, text_and_encrypted_reasoning_details};
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+#[test]
+fn bedrock_stream_metadata_is_unique_stable_and_recent() -> TestResult {
+    let engine = TranslationEngine::default();
+    for (target, prefix, timestamp) in [
+        (WireFormat::OpenAiChat, "chatcmpl_", Some("created")),
+        (WireFormat::OpenAiResponses, "resp_", Some("created_at")),
+        (WireFormat::AnthropicMessages, "msg_", None),
+    ] {
+        let mut ids = std::collections::HashSet::new();
+        for send_stop in [false, true] {
+            for _ in 0..2 {
+                let before = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+                let mut state = StreamTranslationState::new(WireFormat::BedrockConverse, target);
+                state.target_model = Some("served-bedrock".to_string());
+                let mut input = vec![
+                    json!({"messageStart": {"role": "assistant"}}),
+                    json!({"contentBlockDelta": {
+                        "contentBlockIndex": 0, "delta": {"text": "Hello"}
+                    }}),
+                    json!({"contentBlockDelta": {
+                        "contentBlockIndex": 0, "delta": {"text": " world"}
+                    }}),
+                    json!({"metadata": {
+                        "usage": {"inputTokens": 3, "outputTokens": 2, "totalTokens": 5}
+                    }}),
+                ];
+                if send_stop {
+                    input.push(json!({"messageStop": {"stopReason": "end_turn"}}));
+                }
+                let mut events = Vec::new();
+                for event in input {
+                    events.extend(engine.translate_event(
+                        &mut state,
+                        WireFormat::BedrockConverse,
+                        target,
+                        &event,
+                    )?);
+                }
+                events.extend(engine.finish_stream(&mut state, target)?);
+                let after = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+                let snapshots: Vec<_> = events
+                    .iter()
+                    .filter_map(|event| match target {
+                        WireFormat::OpenAiChat => Some(event),
+                        WireFormat::OpenAiResponses => event.get("response"),
+                        WireFormat::AnthropicMessages => event.get("message"),
+                        _ => None,
+                    })
+                    .collect();
+                let first = *snapshots.first().ok_or("missing stream metadata")?;
+                let id = first["id"].as_str().ok_or("missing stream ID")?;
+                assert!(id.starts_with(prefix), "{target:?}: {id}");
+                assert!(ids.insert(id.to_string()), "{target:?}: duplicate ID {id}");
+                let minimum = match target {
+                    WireFormat::OpenAiChat => 3,
+                    WireFormat::OpenAiResponses => 2,
+                    _ => 1,
+                };
+                assert!(snapshots.len() >= minimum, "{target:?}: missing chunks");
+                for snapshot in snapshots {
+                    assert_eq!(snapshot["id"], id, "{target:?}: stream ID changed");
+                    assert_eq!(snapshot["model"], "served-bedrock");
+                    if let Some(field) = timestamp {
+                        assert_eq!(snapshot[field], first[field], "{target:?}: time changed");
+                        let created = snapshot[field].as_u64().ok_or("missing creation time")?;
+                        assert!(created > 0 && (before..=after).contains(&created));
+                    }
+                }
+                assert!(
+                    events.iter().any(|event| match target {
+                        WireFormat::OpenAiChat => event["choices"][0]["finish_reason"] == "stop",
+                        WireFormat::OpenAiResponses => event["type"] == "response.completed",
+                        WireFormat::AnthropicMessages => event["type"] == "message_stop",
+                        _ => false,
+                    }),
+                    "{target:?}: missing terminal event"
+                );
+                assert!(engine.finish_stream(&mut state, target)?.is_empty());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn stream_metadata_preserves_upstream_identity_and_exact_replay() -> TestResult {
+    let engine = TranslationEngine::default();
+    let cases = [
+        (
+            WireFormat::OpenAiChat,
+            vec![
+                json!({"id": "msg_upstream", "model": "served-upstream", "created": 123,
+                    "choices": [{"delta": {"role": "assistant", "content": "Hello"}}],
+                    "provider_metadata": {"keep": true}}),
+                json!({"id": "msg_upstream", "model": "served-upstream", "created": 123,
+                    "choices": [{"delta": {}, "finish_reason": "stop"}]}),
+            ],
+        ),
+        (
+            WireFormat::OpenAiResponses,
+            vec![
+                json!({"type": "response.created", "response": {
+                    "id": "msg_upstream", "model": "served-upstream", "created_at": 123,
+                    "status": "in_progress", "output": []},
+                    "provider_metadata": {"keep": true}}),
+                json!({"type": "response.output_text.delta", "output_index": 0, "delta": "Hello"}),
+                json!({"type": "response.completed", "response": {
+                    "id": "msg_upstream", "model": "served-upstream", "created_at": 123,
+                    "status": "completed", "output": []}}),
+            ],
+        ),
+        (
+            WireFormat::AnthropicMessages,
+            vec![
+                json!({"type": "message_start", "message": {
+                    "id": "msg_upstream", "model": "served-upstream",
+                    "type": "message", "role": "assistant", "content": []},
+                    "provider_metadata": {"keep": true}}),
+                json!({"type": "content_block_delta", "index": 0,
+                    "delta": {"type": "text_delta", "text": "Hello"}}),
+                json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
+                json!({"type": "message_stop"}),
+            ],
+        ),
+    ];
+    for (source, input) in cases {
+        for target in [
+            WireFormat::OpenAiChat,
+            WireFormat::OpenAiResponses,
+            WireFormat::AnthropicMessages,
+        ] {
+            let mut state = StreamTranslationState::new(source, target);
+            let mut decoder = StreamTranslationState::default();
+            let mut events = Vec::new();
+            for event in &input {
+                let decoded = engine.decode_stream_event(&mut decoder, source, event.clone())?;
+                events.extend(engine.encode_stream_event(&mut state, target, decoded)?);
+            }
+            events.extend(engine.finish_stream(&mut state, target)?);
+            if source == target {
+                assert_eq!(events, input, "{source:?}: exact same-format events");
+                continue;
+            }
+            let snapshots: Vec<_> = events
+                .iter()
+                .filter_map(|event| match target {
+                    WireFormat::OpenAiChat => Some(event),
+                    WireFormat::OpenAiResponses => event.get("response"),
+                    WireFormat::AnthropicMessages => event.get("message"),
+                    _ => None,
+                })
+                .collect();
+            assert!(!snapshots.is_empty(), "{source:?} -> {target:?}");
+            let expected_id = if target == WireFormat::OpenAiChat {
+                "chatcmpl_upstream"
+            } else {
+                "msg_upstream"
+            };
+            for snapshot in snapshots {
+                assert_eq!(snapshot["id"], expected_id, "{source:?} -> {target:?}");
+                assert_eq!(snapshot["model"], "served-upstream");
+            }
+        }
+    }
+    Ok(())
+}
 
 #[test]
 fn fragmented_chat_tool_names_are_complete_in_cross_format_streams() -> TestResult {

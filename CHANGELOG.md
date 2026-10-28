@@ -45,6 +45,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Translated responses now generate unique ids and current creation timestamps
+  instead of placeholder metadata when the provider does not supply it.
+  Streamed chunks share one generated id and timestamp per response.
 - **Chat `stop` after tool calls** — a Chat provider that ends a tool-calling
   turn with `finish_reason: "stop"` (Google does) now yields a tool-use stop, so
   Anthropic and Responses clients are asked to run the tools instead of seeing
