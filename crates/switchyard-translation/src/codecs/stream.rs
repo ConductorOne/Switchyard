@@ -12,6 +12,7 @@ use serde_json::{Map, Value, json};
 use crate::LlmResponseChunk;
 use crate::codecs::anthropic::AnthropicMessagesStreamCodec;
 use crate::codecs::bedrock::stream::BedrockConverseStreamCodec;
+use crate::codecs::common::unix_timestamp;
 use crate::codecs::openai_chat::OpenAiChatStreamCodec;
 use crate::codecs::responses::OpenAiResponsesStreamCodec;
 use crate::engine::{FormatRegistry, TranslationEngine};
@@ -33,6 +34,8 @@ pub struct StreamTranslationState {
     pub target_model: Option<String>,
     /// Optional message/response ID the target stream should expose to the client.
     pub target_message_id: Option<String>,
+    #[serde(default)]
+    pub(crate) generated_metadata: GeneratedResponseMetadata,
     pub saw_message_start: bool,
     pub emitted_message_start: bool,
     pub finished: bool,
@@ -99,6 +102,22 @@ pub struct StreamTranslationState {
 
     pub(crate) reasoning_block_index: Option<usize>,
     pub(crate) reasoning_block_started: bool,
+}
+
+/// Fallback identity and creation time belong to the stream, not individual chunks.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct GeneratedResponseMetadata {
+    pub(crate) id: String,
+    pub(crate) created_at: u64,
+}
+
+impl Default for GeneratedResponseMetadata {
+    fn default() -> Self {
+        Self {
+            id: uuid::Uuid::now_v7().simple().to_string(),
+            created_at: unix_timestamp(),
+        }
+    }
 }
 
 // One Responses reasoning output item under construction by the encoder.

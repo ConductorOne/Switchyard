@@ -6,8 +6,8 @@
 use serde_json::{Map, Value, json};
 
 use crate::codecs::common::{
-    ANTHROPIC_REQUEST_KEY, is_anthropic_request, is_known_role_name, provider_extensions,
-    text_from_blocks,
+    ANTHROPIC_REQUEST_KEY, is_anthropic_request, is_known_role_name, new_response_id,
+    provider_extensions, text_from_blocks,
 };
 use crate::codecs::openai_chat::{decode_file_source, decode_image_source};
 use crate::codecs::structured_output::decode_openai_schema_enforcement;
@@ -446,7 +446,7 @@ impl FormatCodec for AnthropicMessagesCodec {
             .unwrap_or_else(|| vec![json!({"type": "text", "text": ""})]);
         let normalized_stop_reason = output.and_then(|output| output.stop_reason);
         let body = json!({
-            "id": response.id.clone().unwrap_or_else(|| "msg_switchyard".to_string()),
+            "id": response.id.clone().unwrap_or_else(|| new_response_id("msg")),
             "type": "message",
             "role": "assistant",
             "model": response.model.clone().unwrap_or_else(|| "unknown".to_string()),

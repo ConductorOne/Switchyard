@@ -860,7 +860,7 @@ fn responses_stream_response(
     ResponsesStreamResponse {
         id: responses_id(state),
         object: "response",
-        created_at: 0,
+        created_at: state.generated_metadata.created_at,
         completed_at: None,
         error: None,
         incomplete_details,
@@ -1247,6 +1247,6 @@ fn fnv1a_64(text: &str) -> u64 {
 // Keep the response ID aligned with buffered responses and stored conversation history.
 fn responses_id(state: &StreamTranslationState) -> String {
     target_message_id_or_source_message_id(state)
-        .unwrap_or("resp_switchyard")
-        .to_string()
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("resp_{}", state.generated_metadata.id))
 }

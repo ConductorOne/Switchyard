@@ -3,10 +3,23 @@
 
 //! Provider-agnostic helpers shared by wire-format codecs.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use serde_json::{Map, Value};
 
 use crate::error::{Result, TranslationError};
 use crate::llm::{ContentBlock, LlmRequest, Tool, ToolChoice};
+
+pub(crate) fn new_response_id(prefix: &str) -> String {
+    format!("{prefix}_{}", uuid::Uuid::now_v7().simple())
+}
+
+pub(crate) fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 // Internal provenance survives mutations that invalidate exact request replay.
 pub(crate) const ANTHROPIC_REQUEST_KEY: &str = "switchyard_anthropic_request";

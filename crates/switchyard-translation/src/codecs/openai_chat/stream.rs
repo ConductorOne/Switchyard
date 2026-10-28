@@ -12,7 +12,7 @@ use crate::LlmResponseChunk;
 use crate::codecs::common::{first_nonempty_string, reasoning_text_from_details};
 use crate::codecs::stream::{
     StreamCodec, StreamTranslationState, record_source_identity, string_field,
-    target_model_or_source_model,
+    target_message_id_or_source_message_id, target_model_or_source_model,
 };
 use crate::format::{FormatId, WireFormat};
 
@@ -509,6 +509,13 @@ fn encode_openai_chat_stream(
     if state.errored {
         return Vec::new();
     }
+    // A late source ID must not replace a generated ID already sent to the client.
+    if state.target_message_id.is_none()
+        && state.message_id.is_none()
+        && !matches!(&event, LlmResponseChunk::MessageStart { id: Some(_), .. })
+    {
+        state.target_message_id = Some(openai_stream_id(state));
+    }
     match event {
         LlmResponseChunk::MessageStart { id, model } => {
             record_source_identity(state, id, model);
@@ -718,7 +725,7 @@ fn openai_stream_chunk(
     let mut payload = json!({
         "id": openai_stream_id(state),
         "object": "chat.completion.chunk",
-        "created": 0,
+        "created": state.generated_metadata.created_at,
         "model": target_model_or_source_model(state),
         "choices": [{
             "index": 0,
@@ -774,8 +781,8 @@ fn openai_tool_call_chunk(
 
 // Converts any upstream message ID into an OpenAI-looking stream ID.
 fn openai_stream_id(state: &StreamTranslationState) -> String {
-    let Some(id) = state.message_id.as_deref() else {
-        return "chatcmpl_switchyard".to_string();
+    let Some(id) = target_message_id_or_source_message_id(state) else {
+        return format!("chatcmpl_{}", state.generated_metadata.id);
     };
     if id.starts_with("chatcmpl") {
         id.to_string()
